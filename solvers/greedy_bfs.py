@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import time
-from collections import deque
-from typing import Dict, Iterable, List, Optional, Tuple
+from collections import deque, OrderedDict
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from env import DeliveryEnv, Order, Shipper, is_valid_cell, valid_next_pos, delivery_reward
 from solvers.solver import Solver
@@ -48,8 +48,8 @@ class GreedyBFS(Solver):
         self._adj: Dict[Position, List[Tuple[Move, Position]]] = {}
         self._build_adjacency_list()
         
-        # Single-source BFS cache: start -> (dist_map, next_move_map)
-        self._bfs_cache: Dict[Position, Tuple[Dict[Position, int], Dict[Position, Move]]] = {}
+        # Single-source BFS cache: start -> (dist_map, next_move_map or None)
+        self._bfs_cache: Dict[Position, Tuple[Dict[Position, int], Optional[Dict[Position, Move]]]] = {}
         
         # Cache khoảng cách từ (sx, sy) đến (ex, ey) của từng đơn hàng: order_id -> khoảng cách
         self._order_delivery_dist: Dict[int, int] = {}
@@ -82,7 +82,7 @@ class GreedyBFS(Solver):
 
     def _bfs_from(self, start: Position) -> Tuple[Dict[Position, int], Dict[Position, Move]]:
         """Chạy BFS một nguồn (start) tính khoảng cách và next move tới tất cả các ô có thể đi đến."""
-        if start in self._bfs_cache:
+        if start in self._bfs_cache and self._bfs_cache[start][1] is not None:
             return self._bfs_cache[start]
 
         dist_map = {start: 0}
@@ -92,27 +92,62 @@ class GreedyBFS(Solver):
             self._bfs_cache[start] = (dist_map, next_move_map)
             return dist_map, next_move_map
 
-        queue = deque([start])
+        queue = deque()
+        queue_append = queue.append
+        queue_popleft = queue.popleft
+        neighbors = self._adj
         
-        # Thiết lập first move cho láng giềng trực tiếp của start
-        for move, nxt in self._neighbors(start):
+        for move, nxt in neighbors.get(start, []):
             dist_map[nxt] = 1
             next_move_map[nxt] = move
-            queue.append(nxt)
+            queue_append(nxt)
 
         while queue:
-            curr = queue.popleft()
+            curr = queue_popleft()
             d_curr = dist_map[curr]
             m_curr = next_move_map[curr]
+            d_nxt = d_curr + 1
 
-            for move, nxt in self._neighbors(curr):
+            for _, nxt in neighbors.get(curr, []):
                 if nxt not in dist_map:
-                    dist_map[nxt] = d_curr + 1
+                    dist_map[nxt] = d_nxt
                     next_move_map[nxt] = m_curr
-                    queue.append(nxt)
+                    queue_append(nxt)
 
         self._bfs_cache[start] = (dist_map, next_move_map)
         return dist_map, next_move_map
+
+    def _dist_bfs_from(self, start: Position) -> Dict[Position, int]:
+        """Chạy BFS chỉ tính khoảng cách (không tính next move) để tối ưu hiệu năng."""
+        if start in self._bfs_cache:
+            return self._bfs_cache[start][0]
+
+        # Nếu start là vị trí của shipper, ta tính gộp cả next_move_map
+        if hasattr(self, "_all_shipper_positions") and start in self._all_shipper_positions:
+            dist_map, _ = self._bfs_from(start)
+            return dist_map
+
+        dist_map = {start: 0}
+        if not is_valid_cell(start, self.grid):
+            self._bfs_cache[start] = (dist_map, None)
+            return dist_map
+
+        queue = deque([start])
+        queue_append = queue.append
+        queue_popleft = queue.popleft
+        neighbors = self._adj
+
+        while queue:
+            curr = queue_popleft()
+            d_nxt = dist_map[curr] + 1
+
+            for _, nxt in neighbors.get(curr, []):
+                if nxt not in dist_map:
+                    dist_map[nxt] = d_nxt
+                    queue_append(nxt)
+
+        self._bfs_cache[start] = (dist_map, None)
+        return dist_map
 
     def _distance(self, start: Position, goal: Position) -> int:
         """Khoảng cách đường đi ngắn nhất giữa start và goal."""
@@ -123,13 +158,25 @@ class GreedyBFS(Solver):
         if goal in self._bfs_cache:
             return self._bfs_cache[goal][0].get(start, INF)
             
-        dist_map, _ = self._bfs_from(start)
+        dist_map = self._dist_bfs_from(start)
         return dist_map.get(goal, INF)
+
+    def _quick_distance(self, start: Position, goal: Position) -> int:
+        """Khoảng cách nhanh sử dụng cache BFS, nếu chưa tính thì ước lượng bằng Manhattan."""
+        if start == goal:
+            return 0
+        if start in self._bfs_cache:
+            return self._bfs_cache[start][0].get(goal, INF)
+        if goal in self._bfs_cache:
+            return self._bfs_cache[goal][0].get(start, INF)
+        return abs(start[0] - goal[0]) + abs(start[1] - goal[1])
 
     def _next_move(self, start: Position, goal: Position) -> Move:
         """Bước đi tiếp theo đầu tiên từ start đi đến goal."""
         if start == goal:
             return "S"
+        if start in self._bfs_cache and self._bfs_cache[start][1] is not None:
+            return self._bfs_cache[start][1].get(goal, "S")
         _, next_move_map = self._bfs_from(start)
         return next_move_map.get(goal, "S")
 
@@ -212,31 +259,39 @@ class GreedyBFS(Solver):
         Ước tính net reward/step nếu shipper đi nhặt rồi giao order này.
         Giá trị càng cao = đơn càng đáng nhặt.
         """
+        key = (shipper.position, order.id)
+        if hasattr(self, "_score_cache") and key in self._score_cache:
+            return self._score_cache[key]
+
         dist_pickup  = self._distance(shipper.position, (order.sx, order.sy))
         dist_deliver = self._get_order_delivery_dist(order)
         
         if dist_pickup >= INF or dist_deliver >= INF:
-            return -INF
-        
-        # Thời điểm ước tính giao được hàng
-        t_estimated_delivery = current_t + dist_pickup + dist_deliver
-        
-        # Phần thưởng ước tính theo công thức đề bài
-        expected_reward = delivery_reward(order, t_estimated_delivery, T)
-        
-        expiry_mult = 1.0
-        
-        # Tổng chi phí bước đi (dùng để normalize)
-        total_steps = max(dist_pickup + dist_deliver, 1)
-        
-        # Urgency factor: đơn sắp hết hạn thì ưu tiên hơn, nhưng nếu trễ thì urgency = 0
-        if t_estimated_delivery > order.et:
-            urgency = 0.0
+            score = -INF
         else:
-            time_slack = max(order.et - current_t, 1)
-            urgency = 1.0 / time_slack  # cao nếu deadline gần
-        
-        return (expected_reward * expiry_mult) / total_steps + urgency * 10.0
+            # Thời điểm ước tính giao được hàng
+            t_estimated_delivery = current_t + dist_pickup + dist_deliver
+            
+            # Phần thưởng ước tính theo công thức đề bài
+            expected_reward = delivery_reward(order, t_estimated_delivery, T)
+            
+            expiry_mult = 1.0
+            
+            # Tổng chi phí bước đi (dùng để normalize)
+            total_steps = max(dist_pickup + dist_deliver, 1)
+            
+            # Urgency factor: đơn sắp hết hạn thì ưu tiên hơn, nhưng nếu trễ thì urgency = 0
+            if t_estimated_delivery > order.et:
+                urgency = 0.0
+            else:
+                time_slack = max(order.et - current_t, 1)
+                urgency = 1.0 / time_slack  # cao nếu deadline gần
+            
+            score = (expected_reward * expiry_mult) / total_steps + urgency * 10.0
+
+        if hasattr(self, "_score_cache"):
+            self._score_cache[key] = score
+        return score
 
     def _select_pickup_v1(
         self,
@@ -260,7 +315,7 @@ class GreedyBFS(Solver):
             return None
 
         # Chạy BFS để có khoảng cách chính xác tới mọi ô từ vị trí shipper
-        dist_map, _ = self._bfs_from(shipper.position)
+        dist_map = self._dist_bfs_from(shipper.position)
 
         valid_candidates = []
         for order in candidates:
@@ -393,27 +448,15 @@ class GreedyBFS(Solver):
         candidate: Order,
         current_t: int,
         orders: Dict[int, Order],
+        bag_orders: List[Order],
+        baseline_reward: float,
     ) -> float:
         """
         Tính net gain (reward) nếu nhặt thêm candidate.
         """
         T = self.env.T
-        bag_orders = [
-            orders[oid] for oid in shipper.bag
-            if oid in orders and not orders[oid].delivered
-        ]
         
-        # 1. Tính baseline reward (không nhặt candidate, đi giao các đơn hiện tại)
-        baseline_times = self._estimate_route_times(shipper.position, [], bag_orders, current_t)
-        if not baseline_times:
-            return -INF
-        
-        baseline_reward = 0.0
-        for o in bag_orders:
-            est_t = baseline_times.get(o.id, INF)
-            baseline_reward += delivery_reward(o, est_t, T)
-            
-        # 2. Với candidate: đi nhặt candidate trước, rồi giao tất cả
+        # Với candidate: đi nhặt candidate trước, rồi giao tất cả
         new_times = self._estimate_route_times(shipper.position, [candidate], bag_orders, current_t)
         if not new_times:
             return -INF
@@ -461,8 +504,23 @@ class GreedyBFS(Solver):
                 or current_weight >= shipper.W_max):
             return None
 
+        bag_orders = [
+            orders[oid] for oid in shipper.bag
+            if oid in orders and not orders[oid].delivered
+        ]
+        
+        # 1. Tính baseline reward (không nhặt candidate, đi giao các đơn hiện tại)
+        baseline_times = self._estimate_route_times(shipper.position, [], bag_orders, current_t)
+        if not baseline_times:
+            return None
+        
+        baseline_reward = 0.0
+        for o in bag_orders:
+            est_t = baseline_times.get(o.id, INF)
+            baseline_reward += delivery_reward(o, est_t, self.env.T)
+
         # BFS để lấy khoảng cách thực tế từ shipper.position
-        dist_map, _ = self._bfs_from(shipper.position)
+        dist_map = self._dist_bfs_from(shipper.position)
 
         best_order: Optional[Order] = None
         best_gain = 0.0  # Ngưỡng: chỉ nhặt khi gain > 0
@@ -485,8 +543,13 @@ class GreedyBFS(Solver):
             if order.et <= current_t:
                 continue
 
+            # Check khả thi nhanh: d_to_pickup + d_to_delivery > thời gian còn lại
+            d_to_delivery = self._get_order_delivery_dist(order)
+            if current_t + d_to_pickup + d_to_delivery > order.et:
+                continue
+
             gain = self._evaluate_opportunistic_pickup(
-                shipper, order, current_t, orders
+                shipper, order, current_t, orders, bag_orders, baseline_reward
             )
             if gain > best_gain:
                 best_gain  = gain
@@ -509,7 +572,7 @@ class GreedyBFS(Solver):
             return None
         
         # Lấy khoảng cách BFS thực tế từ vị trí shipper
-        dist_map, _ = self._bfs_from(shipper.position)
+        dist_map = self._dist_bfs_from(shipper.position)
         
         # Lọc các đơn thực sự đến được
         candidates = [o for o in candidates if dist_map.get((o.sx, o.sy), INF) < INF]
@@ -524,53 +587,115 @@ class GreedyBFS(Solver):
         current_pos = shipper.position
         remaining = list(candidates)
         
+        limit = self.max_delivery_delay
+
         while remaining and total_slots < shipper.K_max:
+            # Lấy khoảng cách từ current_pos hiện tại
+            curr_dist = self._dist_bfs_from(current_pos)
+            
+            # Lọc và sắp xếp các đơn còn lại có thể đi đến được và thỏa mãn trọng tải/slot
             valid_rem = [o for o in remaining 
                          if total_weight + o.w <= shipper.W_max 
-                         and total_slots + 1 <= shipper.K_max]
+                         and total_slots + 1 <= shipper.K_max
+                         and curr_dist.get((o.sx, o.sy), INF) < INF]
             if not valid_rem:
                 break
                 
-            curr_dist, _ = self._bfs_from(current_pos)
-            best = min(
-                valid_rem,
-                key=lambda o: curr_dist.get((o.sx, o.sy), INF),
-                default=None
-            )
-            if best is None or curr_dist.get((best.sx, best.sy), INF) >= INF:
-                break
+            # Sắp xếp theo khoảng cách từ current_pos
+            valid_rem.sort(key=lambda o: curr_dist.get((o.sx, o.sy), INF))
             
-            # Thử thêm `best` vào route tạm thời
-            test_route = route + [best]
-            delivery_times = self._estimate_route_times(shipper.position, test_route, [], current_t)
-            
-            if delivery_times:
-                # Đảm bảo các đơn trong route không bị trễ quá limit động
-                ok = True
-                for idx, o in enumerate(test_route):
-                    est_t = delivery_times.get(o.id, INF)
-                    # Nếu là đơn đầu tiên, cho phép giao đúng hạn (limit = 0 cho map lớn).
-                    # Nếu là các đơn sau đó, giữ ngưỡng khắt khe (max_delivery_delay) để tránh gom quá nhiều đơn.
-                    limit = self.max_delivery_delay
-                    if est_t - o.et > limit:
-                        ok = False
-                        break
+            found_next = False
+            for best in valid_rem:
+                # Quick feasibility check
+                d_to_pickup = dist_map.get((best.sx, best.sy), INF)
+                d_to_delivery = self._get_order_delivery_dist(best)
+                if current_t + d_to_pickup + d_to_delivery + 2 > best.et + limit:
+                    remaining.remove(best)
+                    continue
                 
-                if ok:
-                    route = test_route
-                    current_pos = (best.sx, best.sy)
-                    total_weight += best.w
-                    total_slots += 1
-                else:
-                    # Nếu không thể giao trong khoảng trễ cho phép, không đưa vào route
-                    pass
+                # Thử thêm `best` vào route tạm thời
+                test_route = route + [best]
+                delivery_times = self._estimate_route_times(shipper.position, test_route, [], current_t)
+                
+                if delivery_times:
+                    # Đảm bảo các đơn trong route không bị trễ quá limit
+                    ok = True
+                    for o in test_route:
+                        if delivery_times.get(o.id, INF) - o.et > limit:
+                            ok = False
+                            break
+                    
+                    if ok:
+                        route = test_route
+                        current_pos = (best.sx, best.sy)
+                        total_weight += best.w
+                        total_slots += 1
+                        remaining.remove(best)
+                        found_next = True
+                        break  # Thoát loop inner để cập nhật current_pos và curr_dist
+                
+                # Nếu không thể dùng best, loại nó khỏi remaining
+                remaining.remove(best)
             
-            remaining.remove(best)
+            if not found_next:
+                # Nếu duyệt qua tất cả valid_rem mà không thêm được đơn nào, dừng lại
+                break
         
         return route[0] if route else None
 
 
 
+
+    def _is_bottleneck(self, pos: Position) -> bool:
+        """Kiểm tra ô pos có phải nút cổ chai (<= 2 ô trống xung quanh) hay không."""
+        r, c = pos
+        free_neighbors = 0
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < len(self.grid) and 0 <= nc < len(self.grid[0]) and self.grid[nr][nc] == 0:
+                free_neighbors += 1
+        return free_neighbors <= 2
+
+    def _bfs_path_avoiding(self, start: Position, goal: Position, other_positions: Set[Position]) -> Optional[List[Move]]:
+        if start == goal:
+            return []
+            
+        queue = deque([start])
+        visited = {start}
+        parent = {}
+        neighbors = self._adj
+        
+        found = False
+        while queue:
+            curr = queue.popleft()
+            if curr == goal:
+                found = True
+                break
+                
+            curr_neighbors = neighbors.get(curr, [])
+            for move, nxt in curr_neighbors:
+                if nxt in visited:
+                    continue
+                
+                # Tránh các ô có shipper khác đang ở trong nút cổ chai
+                if nxt != goal and nxt in other_positions and self._is_bottleneck(nxt):
+                    continue
+                    
+                visited.add(nxt)
+                parent[nxt] = (curr, move)
+                queue.append(nxt)
+                
+        if not found:
+            return None
+
+        # Reconstruct path
+        path = []
+        curr = goal
+        while curr != start:
+            curr, move = parent[curr]
+            path.append(move)
+        path.reverse()
+        return path
 
     # ------------------------------------------------------------------
     # Policy: tạo action
@@ -579,8 +704,68 @@ class GreedyBFS(Solver):
         """
         Lấy bước đi kế tiếp và vị trí dự kiến sau bước đó.
         """
-        move = self._next_move(shipper.position, goal)
-        next_position = valid_next_pos(shipper.position, move, self.grid)
+        start = shipper.position
+        if start == goal:
+            return "S", start
+
+        move = self._next_move(start, goal)
+        
+        # Chỉ tránh nút cổ chai trên bản đồ lớn (N >= 100)
+        if len(self.grid) >= 100:
+            blocking_obstacles = set()
+            shipper_goals = getattr(self, "_shipper_goals", {})
+            all_shippers = getattr(self, "_all_shippers", [])
+            
+            for s in all_shippers:
+                if s.id == shipper.id:
+                    continue
+                pos_B = s.position
+                if self._is_bottleneck(pos_B):
+                    # Ước lượng điểm đến của B
+                    goal_B = shipper_goals.get(s.id, pos_B)
+                    move_B = self._next_move(pos_B, goal_B)
+                    nxt_B = valid_next_pos(pos_B, move_B, self.grid)
+                    
+                    # Kiểm tra xem B có đang đi về phía A (ngược chiều) hoặc đứng yên hay không
+                    dist_pos_B = abs(pos_B[0] - start[0]) + abs(pos_B[1] - start[1])
+                    dist_nxt_B = abs(nxt_B[0] - start[0]) + abs(nxt_B[1] - start[1])
+                    
+                    # B không đi xa A ra (tức là đi ngược chiều hoặc đứng yên)
+                    if dist_nxt_B <= dist_pos_B:
+                        # Nếu là hàng xóm trực tiếp (khoảng cách = 1) và đối đầu trực diện:
+                        # Giải quyết bằng độ ưu tiên ID (ID nhỏ được đi, ID lớn nhường)
+                        if dist_pos_B == 1:
+                            if shipper.id > s.id:
+                                blocking_obstacles.add(pos_B)
+                        else:
+                            blocking_obstacles.add(pos_B)
+                            
+            if blocking_obstacles:
+                # Kiểm tra xem đường đi chuẩn 15 bước tới có đi qua ô bị chặn nào không
+                path_blocked = False
+                curr = start
+                path_set = {curr}
+                for _ in range(15):
+                    move_step = self._next_move(curr, goal)
+                    if move_step == "S":
+                        break
+                    nxt = valid_next_pos(curr, move_step, self.grid)
+                    if nxt == curr or nxt in path_set:
+                        break
+                    path_set.add(nxt)
+                    if nxt in blocking_obstacles:
+                        path_blocked = True
+                        break
+                    curr = nxt
+
+                if path_blocked:
+                    alt_path = self._bfs_path_avoiding(start, goal, blocking_obstacles)
+                    if alt_path:
+                        move = alt_path[0]
+                    else:
+                        move = "S"  # Đứng yên ngoài nút cổ chai chờ thông đường
+
+        next_position = valid_next_pos(start, move, self.grid)
         return move, next_position
 
     def _delivery_action(self, shipper: Shipper, order: Order) -> Action:
@@ -599,12 +784,46 @@ class GreedyBFS(Solver):
         return (move, 1) if next_position == goal else (move, 0)
 
     def _decide_actions(self, obs: dict) -> Dict[int, Action]:
+        self._score_cache = {}
         orders   = obs["orders"]
         shippers = obs["shippers"]
         current_t = obs.get("t", 0)
+        
+        self._all_shippers = shippers
+        self._all_shipper_positions = {s.position for s in shippers}
+        
+        # Tiền tính toán mục tiêu của mỗi shipper để ước lượng hướng đi của chúng
+        self._shipper_goals = {}
+        for s in shippers:
+            if len(s.bag) > 0:
+                delivery_order = self._select_delivery(s, orders)
+                if delivery_order:
+                    self._shipper_goals[s.id] = (delivery_order.ex, delivery_order.ey)
+                else:
+                    self._shipper_goals[s.id] = s.position
+            else:
+                pickup_order = self._plan_multi_pickup_route(s, orders, current_t)
+                if pickup_order is None:
+                    # heuristic: chọn đơn chưa nhận gần nhất
+                    best_order = None
+                    best_dist = INF
+                    for o in orders.values():
+                        if not o.picked and not o.delivered:
+                            d = abs(s.r - o.sx) + abs(s.c - o.sy)
+                            if d < best_dist:
+                                  best_dist = d
+                                  best_order = o
+                    if best_order:
+                        pickup_order = best_order
+                if pickup_order:
+                    self._shipper_goals[s.id] = (pickup_order.sx, pickup_order.sy)
+                else:
+                    self._shipper_goals[s.id] = s.position
 
         actions: Dict[int, Action]   = {}
+        goals: Dict[int, Position]   = {}
         reserved_pickups: set[int]   = set()
+        self._last_types = {}
 
         shippers_with_cargo = []
         shippers_empty = []
@@ -633,6 +852,8 @@ class GreedyBFS(Solver):
                 # Các shipper còn lại không tìm được đơn hàng nào phù hợp
                 for shipper in unmatched_shippers:
                     actions[shipper.id] = ("S", 0)
+                    goals[shipper.id] = shipper.position
+                    self._last_types[shipper.id] = "none"
                 break
                 
             # Sắp xếp theo score giảm dần (ưu tiên đơn mang lại reward/step cao nhất), sau đó là dist tăng dần
@@ -643,8 +864,9 @@ class GreedyBFS(Solver):
             
             reserved_pickups.add(best_order.id)
             actions[best_shipper.id] = self._pickup_action(best_shipper, best_order)
+            goals[best_shipper.id] = (best_order.sx, best_order.sy)
+            self._last_types[best_shipper.id] = "pickup"
             unmatched_shippers.remove(best_shipper)
-
 
         # 2. Xử lý shippers đang mang hàng sau
         for shipper in sorted(shippers_with_cargo, key=lambda s: (len(s.bag), s.id)):
@@ -658,6 +880,8 @@ class GreedyBFS(Solver):
                         break
             if at_delivery_dest:
                 actions[shipper.id] = ("S", 2)
+                goals[shipper.id] = shipper.position
+                self._last_types[shipper.id] = "delivery"
                 continue
 
             delivery_order = self._select_delivery(shipper, orders)
@@ -675,6 +899,8 @@ class GreedyBFS(Solver):
                     reserved_pickups.add(opp.id)
                     if shipper.position == (opp.sx, opp.sy):
                         actions[shipper.id] = ("S", 1)
+                        goals[shipper.id] = shipper.position
+                        self._last_types[shipper.id] = "pickup"
                     else:
                         dist_to_opp_pickup = self._distance(
                             shipper.position, (opp.sx, opp.sy)
@@ -684,19 +910,29 @@ class GreedyBFS(Solver):
                         )
                         if dist_to_opp_pickup <= dist_to_delivery:
                             actions[shipper.id] = self._pickup_action(shipper, opp)
+                            goals[shipper.id] = (opp.sx, opp.sy)
+                            self._last_types[shipper.id] = "pickup"
                         else:
                             actions[shipper.id] = self._delivery_action(
                                 shipper, delivery_order
                             )
+                            goals[shipper.id] = (delivery_order.ex, delivery_order.ey)
+                            self._last_types[shipper.id] = "delivery"
                     continue
 
                 actions[shipper.id] = self._delivery_action(shipper, delivery_order)
+                goals[shipper.id] = (delivery_order.ex, delivery_order.ey)
+                self._last_types[shipper.id] = "delivery"
                 continue
             else:
                 actions[shipper.id] = ("S", 0)
-        return self._resolve_deadlocks(shippers, actions)
+                goals[shipper.id] = shipper.position
+                self._last_types[shipper.id] = "none"
+        
+        self._last_goals = goals
+        return self._resolve_deadlocks(shippers, actions, goals)
 
-    def _resolve_deadlocks(self, shippers: List[Shipper], actions: Dict[int, Action]) -> Dict[int, Action]:
+    def _resolve_deadlocks(self, shippers: List[Shipper], actions: Dict[int, Action], goals: Dict[int, Position]) -> Dict[int, Action]:
         """
         Phát hiện và giải quyết các trường hợp 2 shipper đối đầu trực tiếp (head-on collision)
         tại các nút cổ chai hoặc hành lang hẹp bằng cách nhường đường.
@@ -761,8 +997,23 @@ class GreedyBFS(Solver):
     def run(self) -> dict:
         start_time = time.time()
         obs = self.env.reset()
+        seen_order_ids = set()
 
         while not obs.get("done", False):
+            for oid in obs["orders"].keys():
+                seen_order_ids.add(oid)
+
+            # Ba điều kiện kết hợp để chắc chắn không bỏ sót việc gì:
+            # 1. Đã sinh đủ G đơn
+            cond1 = (len(seen_order_ids) == obs["G"])
+            # 2. Không shipper nào còn hàng trong tay
+            cond2 = all(len(s.bag) == 0 for s in obs["shippers"])
+            # 3. Không còn đơn active nào trên map (đã được pick)
+            cond3 = all(o.picked for o in obs["orders"].values())
+
+            if cond1 and cond2 and cond3:
+                break
+
             actions = self._decide_actions(obs)
             obs, _, done, _ = self.env.step(actions)
             if done:
