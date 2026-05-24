@@ -90,6 +90,11 @@ class GreedyBFS(Solver):
         """Trả về danh sách láng giềng kề hợp lệ O(1) từ cache."""
         return self._adj.get(pos, [])
 
+    def _save_bfs_cache(self, key: Position, val: Tuple[Dict[Position, int], Optional[Dict[Position, Move]]]):
+        if len(self._bfs_cache) > 4000:
+            self._bfs_cache.clear()
+        self._bfs_cache[key] = val
+
     def _bfs_from(self, start: Position) -> Tuple[Dict[Position, int], Dict[Position, Move]]:
         """Chạy BFS một nguồn (start) tính khoảng cách và next move tới tất cả các ô có thể đi đến."""
         if start in self._bfs_cache and self._bfs_cache[start][1] is not None:
@@ -99,7 +104,7 @@ class GreedyBFS(Solver):
         next_move_map = {start: "S"}
 
         if not is_valid_cell(start, self.grid):
-            self._bfs_cache[start] = (dist_map, next_move_map)
+            self._save_bfs_cache(start, (dist_map, next_move_map))
             return dist_map, next_move_map
 
         queue = deque()
@@ -124,7 +129,7 @@ class GreedyBFS(Solver):
                     next_move_map[nxt] = m_curr
                     queue_append(nxt)
 
-        self._bfs_cache[start] = (dist_map, next_move_map)
+        self._save_bfs_cache(start, (dist_map, next_move_map))
         return dist_map, next_move_map
 
     def _dist_bfs_from(self, start: Position) -> Dict[Position, int]:
@@ -139,7 +144,7 @@ class GreedyBFS(Solver):
 
         dist_map = {start: 0}
         if not is_valid_cell(start, self.grid):
-            self._bfs_cache[start] = (dist_map, None)
+            self._save_bfs_cache(start, (dist_map, None))
             return dist_map
 
         queue = deque([start])
@@ -156,7 +161,7 @@ class GreedyBFS(Solver):
                     dist_map[nxt] = d_nxt
                     queue_append(nxt)
 
-        self._bfs_cache[start] = (dist_map, None)
+        self._save_bfs_cache(start, (dist_map, None))
         return dist_map
 
     def _distance(self, start: Position, goal: Position) -> int:
@@ -219,49 +224,6 @@ class GreedyBFS(Solver):
         return min(carried_orders, key=sort_key)
 
 
-    # ------------------------------------------------------------------
-    # Policy: chọn đơn chưa nhặt để nhặt (cũ, để tham khảo)
-    # ------------------------------------------------------------------
-    def _select_pickup_v0(
-        self,
-        shipper: Shipper,
-        orders: Dict[int, Order],
-        reserved_order_ids: set[int],
-    ) -> Optional[Order]:
-        """
-        Chọn đơn chưa nhặt có pickup gần nhất và shipper còn khả năng chở.
-
-        Ưu tiên: 
-        1. Pickup gần nhất
-        2. Net reward
-        3. Time slack
-        4. Id
-
-        Kết quả: 1447.98
-        """
-        candidates: List[Order] = []
-
-        for order in orders.values():
-            if order.id in reserved_order_ids:
-                continue
-            if not shipper.can_carry(order, orders):
-                continue
-            if self._distance(shipper.position, (order.sx, order.sy)) >= INF:
-                continue
-            candidates.append(order)
-
-        if not candidates:
-            return None
-
-        return min(
-            candidates,
-            key=lambda order: (
-                self._distance(shipper.position, (order.sx, order.sy)),
-                -order.p,
-                order.et,
-                order.id,
-            ),
-        )
 
     """Tầng 0: Reward-Aware Scoring"""
     def _order_pickup_score(self, shipper, order, current_t, T):
@@ -343,65 +305,6 @@ class GreedyBFS(Solver):
             ),
         )
 
-
-    """Tầng 1: Nhặt trên đường"""
-    """Sử dụng detour - fail"""
-    def _max_detour(self, shipper, carried_order, current_t):
-        """
-        Detour tối đa phụ thuộc vào deadline của đơn đang mang.
-        Deadline còn xa → cho phép đi vòng nhiều hơn.
-        Deadline gấp   → gần như không cho phép chệch.
-        """
-        dist_to_delivery = self._distance(
-            shipper.position, (carried_order.ex, carried_order.ey)
-        )
-        time_to_deadline = carried_order.et - current_t
-        time_slack = time_to_deadline - dist_to_delivery  # bước dư
-        
-        if time_slack <= 2:
-            return 0   # không còn thời gian chệch
-        elif time_slack <= 5:
-            return 1
-        elif time_slack <= 10:
-            return 2
-        else:
-            return min(time_slack // 3, 4)  # cap ở 4 để tránh đi vòng quá xa
-
-    def _find_opportunistic_pickup_v1(self, shipper, primary_delivery_order, available_orders, current_t):
-        """
-        Tìm đơn có thể nhặt trên đường đi giao primary_delivery_order.
-        Trả về None nếu không có.
-        """
-        if len(shipper.bag) >= shipper.K_max:
-            return None
-       
-        goal = (primary_delivery_order.ex, primary_delivery_order.ey)
-        dist_direct = self._distance(shipper.position, goal)
-        δ = self._max_detour(shipper, primary_delivery_order, current_t)
-        
-        best_order, best_score = None, -INF
-        for order in available_orders.values():
-            if order.picked or order.delivered:
-                continue
-            if not shipper.can_carry(order, available_orders):
-                continue
-            
-            pickup = (order.sx, order.sy)
-            dist_via_pickup = (
-                self._distance(shipper.position, pickup) 
-                + self._distance(pickup, goal)
-            )
-            detour = dist_via_pickup - dist_direct
-            
-            if detour > δ:
-                continue
-            
-            score = self._order_pickup_score(shipper, order, current_t, self.env.T)
-            if score > best_score:
-                best_score = score
-                best_order = order
-        
-        return best_order
 
     """
     Chỉ nhặt khi phần thưởng tăng lên - Tăng 1 chút
@@ -574,6 +477,9 @@ class GreedyBFS(Solver):
         """
         Lập kế hoạch nhặt nhiều đơn trong một chuyến khi bag rỗng.
         """
+        cache_key = (shipper.id, frozenset(available_orders.keys()))
+        if hasattr(self, "_multi_pickup_cache") and cache_key in self._multi_pickup_cache:
+            return self._multi_pickup_cache[cache_key]
         candidates = [
             o for o in available_orders.values()
             if not o.picked and not o.delivered
@@ -596,6 +502,7 @@ class GreedyBFS(Solver):
         route, total_weight, total_slots = [], 0.0, 0
         current_pos = shipper.position
         remaining = list(candidates)
+        curr_t = current_t
         
         limit = self.max_delivery_delay
 
@@ -617,9 +524,9 @@ class GreedyBFS(Solver):
             found_next = False
             for best in valid_rem:
                 # Quick feasibility check
-                d_to_pickup = dist_map.get((best.sx, best.sy), INF)
+                d_to_pickup = curr_dist.get((best.sx, best.sy), INF)
                 d_to_delivery = self._get_order_delivery_dist(best)
-                if current_t + d_to_pickup + d_to_delivery + 2 > best.et + limit:
+                if curr_t + d_to_pickup + d_to_delivery + 2 > best.et + limit:
                     remaining.remove(best)
                     continue
                 
@@ -637,6 +544,7 @@ class GreedyBFS(Solver):
                     
                     if ok:
                         route = test_route
+                        curr_t += d_to_pickup
                         current_pos = (best.sx, best.sy)
                         total_weight += best.w
                         total_slots += 1
@@ -651,7 +559,10 @@ class GreedyBFS(Solver):
                 # Nếu duyệt qua tất cả valid_rem mà không thêm được đơn nào, dừng lại
                 break
         
-        return route[0] if route else None
+        res = route[0] if route else None
+        if hasattr(self, "_multi_pickup_cache"):
+            self._multi_pickup_cache[cache_key] = res
+        return res
 
 
 
@@ -813,6 +724,7 @@ class GreedyBFS(Solver):
 
     def _decide_actions(self, obs: dict) -> Dict[int, Action]:
         self._score_cache = {}
+        self._multi_pickup_cache = {}
         orders   = obs["orders"]
         shippers = obs["shippers"]
         current_t = obs.get("t", 0)
@@ -884,11 +796,24 @@ class GreedyBFS(Solver):
             
             if not candidates_for_shippers:
                 # Các shipper còn lại không tìm được đơn hàng nào phù hợp
-                for shipper in unmatched_shippers:
-                    act, target_pos = self._reposition_action(shipper, orders, current_t)
-                    actions[shipper.id] = act
-                    goals[shipper.id] = target_pos
-                    self._last_types[shipper.id] = "reposition" if act[0] != "S" else "none"
+                # Phân công hotspot theo kiểu Round-robin
+                hotspots = self.detector.predicted_hotspots if (hasattr(self, "detector") and self.detector.is_surge and self.detector.predicted_hotspots) else []
+                sorted_unmatched = sorted(unmatched_shippers, key=lambda s: s.id)
+                
+                for idx, shipper in enumerate(sorted_unmatched):
+                    if hotspots:
+                        assigned_hotspot = hotspots[idx % len(hotspots)]
+                        if assigned_hotspot != shipper.position:
+                            move, next_pos = self._move_towards(shipper, assigned_hotspot)
+                            actions[shipper.id] = (move, 0)
+                            goals[shipper.id] = assigned_hotspot
+                            self._last_types[shipper.id] = "reposition" if move != "S" else "none"
+                            continue
+                    
+                    # Nếu không có hotspot hoặc đã ở đó
+                    actions[shipper.id] = ("S", 0)
+                    goals[shipper.id] = shipper.position
+                    self._last_types[shipper.id] = "none"
                 break
                 
             # Sắp xếp theo score giảm dần (ưu tiên đơn mang lại reward/step cao nhất), sau đó là dist tăng dần
