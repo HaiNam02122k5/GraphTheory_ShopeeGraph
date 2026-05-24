@@ -57,7 +57,7 @@ class OnlineSurgeHotspotDetector:
             candidates = {}
             for (sx, sy), count in self.pickup_counts.items():
                 for dr in range(-3, 4):
-                    for dc in range(-3 + abs(dr), 4 - abs(dr)):
+                    for dc in range(-(3 - abs(dr)), (3 - abs(dr)) + 1):
                         r, c = sx + dr, sy + dc
                         if 0 <= r < self.N and 0 <= c < self.N and self.grid[r][c] == 0:
                             candidates[(r, c)] = candidates.get((r, c), 0) + count

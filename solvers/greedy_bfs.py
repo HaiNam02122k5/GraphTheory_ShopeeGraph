@@ -322,18 +322,28 @@ class GreedyBFS(Solver):
         """
         t = start_t
         curr = shipper_pos
+        is_large_map = (self.env.N > 50)
         
         # Phase 1: Nhặt tất cả pickup_orders
         for o in pickup_orders:
             dist = self._distance(curr, (o.sx, o.sy))
             if dist >= INF:
                 return {}
-            t += dist + 1  # di chuyển + 1 step nhặt
+            if is_large_map:
+                if dist > 0:
+                    t += dist
+                else:
+                    t += 1
+            else:
+                t += dist + 1
             curr = (o.sx, o.sy)
         
         # Phase 2: Giao hàng (bao gồm cả pickup_orders đã nhặt xong và các đơn đã có sẵn trong bag)
         remaining_deliveries = list(pickup_orders) + list(bag_orders)
         delivery_times = {}
+        
+        last_was_delivery = False
+        last_delivery_pos = None
         
         while remaining_deliveries:
             best_d = min(
@@ -348,9 +358,22 @@ class GreedyBFS(Solver):
             dist = self._distance(curr, (best_d.ex, best_d.ey))
             if dist >= INF:
                 return {}
-            t += dist + 1  # di chuyển + 1 step giao
+            
+            if is_large_map:
+                if dist > 0:
+                    t += dist
+                else:
+                    if last_was_delivery and last_delivery_pos == (best_d.ex, best_d.ey):
+                        pass
+                    else:
+                        t += 1
+            else:
+                t += dist + 1
+                
             delivery_times[best_d.id] = t
             curr = (best_d.ex, best_d.ey)
+            last_was_delivery = True
+            last_delivery_pos = curr
             remaining_deliveries.remove(best_d)
             
         return delivery_times
