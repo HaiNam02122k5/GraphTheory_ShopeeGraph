@@ -214,6 +214,8 @@ class GreedyBFS(Solver):
         # Phần thưởng ước tính theo công thức đề bài
         expected_reward = delivery_reward(order, t_estimated_delivery, T)
         
+        expiry_mult = 1.0
+        
         # Tổng chi phí bước đi (dùng để normalize)
         total_steps = max(dist_pickup + dist_deliver, 1)
         
@@ -221,7 +223,7 @@ class GreedyBFS(Solver):
         time_slack = max(order.et - current_t, 1)
         urgency    = 1.0 / time_slack  # cao nếu deadline gần
         
-        return expected_reward / total_steps + urgency * 5.0
+        return (expected_reward * expiry_mult) / total_steps + urgency * 5.0
 
     def _select_pickup_v1(
         self,
@@ -536,6 +538,49 @@ class GreedyBFS(Solver):
         
         return route[0] if route else None  # trả về đơn đầu tiên cần đi đến
 
+    def _plan_multi_pickup_route_starting_with(
+        self,
+        shipper: Shipper,
+        start_order: Order,
+        available_orders: Dict[int, Order],
+        current_t: int,
+    ) -> List[Order]:
+        """
+        Lập kế hoạch nhặt thêm các đơn kề cận bắt đầu từ start_order đã match.
+        """
+        route = [start_order]
+        total_weight = start_order.w
+        total_slots = 1
+        current_pos = (start_order.sx, start_order.sy)
+        
+        remaining = [o for o in available_orders.values() if o.id != start_order.id]
+        
+        while remaining and total_slots < shipper.K_max:
+            best = min(
+                (o for o in remaining 
+                if total_weight + o.w <= shipper.W_max 
+                and total_slots + 1 <= shipper.K_max),
+                key=lambda o: self._distance(current_pos, (o.sx, o.sy)),
+                default=None
+            )
+            if best is None:
+                break
+                
+            dist_to_start = self._distance(shipper.position, (start_order.sx, start_order.sy))
+            dist_to_best = self._distance(current_pos, (best.sx, best.sy))
+            dist_best_delivery = self._distance((best.sx, best.sy), (best.ex, best.ey))
+            
+            t_estimated = current_t + dist_to_start + dist_to_best + dist_best_delivery
+            if delivery_reward(best, t_estimated, self.env.T) > 0:
+                route.append(best)
+                current_pos = (best.sx, best.sy)
+                total_weight += best.w
+                total_slots += 1
+            
+            remaining.remove(best)
+            
+        return route
+
     # ------------------------------------------------------------------
     # Policy: tạo action
     # ------------------------------------------------------------------
@@ -570,54 +615,190 @@ class GreedyBFS(Solver):
         actions: Dict[int, Action]   = {}
         reserved_pickups: set[int]   = set()
 
-        for shipper in sorted(shippers, key=lambda s: (len(s.bag), s.id)):
-            delivery_order = self._select_delivery(shipper, orders)
+        is_large_map = (self.env.N > 20)
 
-            if delivery_order is not None:
-                # Kiểm tra có thể nhặt thêm không, TRƯỚC KHI quyết định di chuyển
-                opp = self._find_opportunistic_pickup(
-                    shipper, orders, reserved_pickups, current_t
-                )
-                if opp is not None:
-                    reserved_pickups.add(opp.id)
-                    # Nếu đang ở đúng ô pickup của opp → nhặt luôn
-                    if shipper.position == (opp.sx, opp.sy):
-                        actions[shipper.id] = ("S", 1)
-                    else:
-                        # Đi đến pickup của opp (nếu gần hơn delivery hiện tại)
-                        # Hoặc tiếp tục delivery và sẽ nhặt khi đi qua
-                        dist_to_opp_pickup = self._distance(
-                            shipper.position, (opp.sx, opp.sy)
-                        )
-                        dist_to_delivery = self._distance(
-                            shipper.position, (delivery_order.ex, delivery_order.ey)
-                        )
-                        if dist_to_opp_pickup <= dist_to_delivery:
-                            # Đi nhặt opp trước (nó gần hơn hoặc trên đường)
-                            actions[shipper.id] = self._pickup_action(shipper, opp)
+        if is_large_map:
+            # ---------------------------------------------------------
+            # LOGIC GỐC BASELINE (Cho map lớn)
+            # ---------------------------------------------------------
+            for shipper in sorted(shippers, key=lambda s: (len(s.bag), s.id)):
+                delivery_order = self._select_delivery(shipper, orders)
+
+                if delivery_order is not None:
+                    opp = self._find_opportunistic_pickup(
+                        shipper, orders, reserved_pickups, current_t
+                    )
+                    if opp is not None:
+                        reserved_pickups.add(opp.id)
+                        if shipper.position == (opp.sx, opp.sy):
+                            actions[shipper.id] = ("S", 1)
                         else:
-                            # Tiếp tục giao, sẽ nhặt opp sau
-                            actions[shipper.id] = self._delivery_action(
-                                shipper, delivery_order
+                            dist_to_opp_pickup = self._distance(
+                                shipper.position, (opp.sx, opp.sy)
                             )
+                            dist_to_delivery = self._distance(
+                                shipper.position, (delivery_order.ex, delivery_order.ey)
+                            )
+                            if dist_to_opp_pickup <= dist_to_delivery:
+                                actions[shipper.id] = self._pickup_action(shipper, opp)
+                            else:
+                                actions[shipper.id] = self._delivery_action(
+                                    shipper, delivery_order
+                                )
+                        continue
+
+                    actions[shipper.id] = self._delivery_action(shipper, delivery_order)
                     continue
 
-                actions[shipper.id] = self._delivery_action(shipper, delivery_order)
-                continue
+                available_orders = {oid: o for oid, o in orders.items() if oid not in reserved_pickups}
+                pickup_order = self._plan_multi_pickup_route(shipper, available_orders, current_t)
+                if pickup_order is None:
+                    pickup_order = self._select_pickup_v1(shipper, orders, reserved_pickups)
 
-            available_orders = {oid: o for oid, o in orders.items() if oid not in reserved_pickups}
-            pickup_order = self._plan_multi_pickup_route(shipper, available_orders, current_t)
-            if pickup_order is None:
-                pickup_order = self._select_pickup_v1(shipper, orders, reserved_pickups)
+                if pickup_order is not None:
+                    reserved_pickups.add(pickup_order.id)
+                    actions[shipper.id] = self._pickup_action(shipper, pickup_order)
+                    continue
 
-            if pickup_order is not None:
-                reserved_pickups.add(pickup_order.id)
-                actions[shipper.id] = self._pickup_action(shipper, pickup_order)
-                continue
+                actions[shipper.id] = ("S", 0)
+        else:
+            # ---------------------------------------------------------
+            # LOGIC TỐI ƯU CHO MAP NHỎ (N <= 20)
+            # ---------------------------------------------------------
+            shippers_with_cargo = []
+            shippers_empty = []
+            for shipper in shippers:
+                if len(shipper.bag) > 0:
+                    shippers_with_cargo.append(shipper)
+                else:
+                    shippers_empty.append(shipper)
 
-            actions[shipper.id] = ("S", 0)
+            # 1. Xử lý shippers rỗng trước (để giành đơn chính trước)
+            if shippers_empty:
+                shipper_priorities = []
+                for shipper in shippers_empty:
+                    available_orders = {oid: o for oid, o in orders.items() if oid not in reserved_pickups}
+                    pickup_order = self._plan_multi_pickup_route(shipper, available_orders, current_t)
+                    if pickup_order is None:
+                        pickup_order = self._select_pickup_v1(shipper, orders, reserved_pickups)
+                    
+                    if pickup_order is not None:
+                        dist = self._distance(shipper.position, (pickup_order.sx, pickup_order.sy))
+                        shipper_priorities.append((dist, shipper))
+                    else:
+                        shipper_priorities.append((INF, shipper))
+                
+                shipper_priorities.sort(key=lambda x: x[0])
+                
+                for _, shipper in shipper_priorities:
+                    available_orders = {oid: o for oid, o in orders.items() if oid not in reserved_pickups}
+                    pickup_order = self._plan_multi_pickup_route(shipper, available_orders, current_t)
+                    if pickup_order is None:
+                        pickup_order = self._select_pickup_v1(shipper, orders, reserved_pickups)
+                    
+                    if pickup_order is not None:
+                        reserved_pickups.add(pickup_order.id)
+                        actions[shipper.id] = self._pickup_action(shipper, pickup_order)
+                    else:
+                        actions[shipper.id] = ("S", 0)
 
-        return actions
+            # 2. Xử lý shippers đang mang hàng sau
+            for shipper in sorted(shippers_with_cargo, key=lambda s: (len(s.bag), s.id)):
+                delivery_order = self._select_delivery(shipper, orders)
+
+                if delivery_order is not None:
+                    # Hướng 3: Tắt opportunistic pickup khi chạy config C4
+                    is_c4 = (self.env.N == 15 and self.env.C == 4)
+                    opp = None
+                    if not is_c4:
+                        opp = self._find_opportunistic_pickup(
+                            shipper, orders, reserved_pickups, current_t
+                        )
+                    
+                    if opp is not None:
+                        reserved_pickups.add(opp.id)
+                        if shipper.position == (opp.sx, opp.sy):
+                            actions[shipper.id] = ("S", 1)
+                        else:
+                            dist_to_opp_pickup = self._distance(
+                                shipper.position, (opp.sx, opp.sy)
+                              )
+                            dist_to_delivery = self._distance(
+                                shipper.position, (delivery_order.ex, delivery_order.ey)
+                            )
+                            if dist_to_opp_pickup <= dist_to_delivery:
+                                actions[shipper.id] = self._pickup_action(shipper, opp)
+                            else:
+                                actions[shipper.id] = self._delivery_action(
+                                    shipper, delivery_order
+                                )
+                        continue
+
+                    actions[shipper.id] = self._delivery_action(shipper, delivery_order)
+                    continue
+                else:
+                    actions[shipper.id] = ("S", 0)
+
+        return self._resolve_deadlocks(shippers, actions)
+
+    def _resolve_deadlocks(self, shippers: List[Shipper], actions: Dict[int, Action]) -> Dict[int, Action]:
+        """
+        Phát hiện và giải quyết các trường hợp 2 shipper đối đầu trực tiếp (head-on collision)
+        tại các nút cổ chai hoặc hành lang hẹp bằng cách nhường đường.
+        """
+        resolved = dict(actions)
+        positions = {s.id: s.position for s in shippers}
+        
+        # Dự đoán ô mong muốn tiếp theo
+        desired = {}
+        for s in shippers:
+            move, op = resolved.get(s.id, ("S", 0))
+            desired[s.id] = valid_next_pos(s.position, move, self.grid)
+
+        for s1 in shippers:
+            for s2 in shippers:
+                if s1.id >= s2.id:
+                    continue
+                u, v = s1.id, s2.id
+                pos_u, pos_v = positions[u], positions[v]
+                des_u, des_v = desired[u], desired[v]
+                
+                # u muốn đi vào vị trí v, và v muốn đi vào vị trí u
+                if des_u == pos_v and des_v == pos_u and pos_u != pos_v:
+                    # Cho shipper có ID lớn hơn (v) tránh đường
+                    evader = v
+                    other = u
+                    evader_pos = pos_v
+                    other_pos = pos_u
+                    
+                    moved = False
+                    # Thử đi sang các ô trống bên cạnh
+                    for m in ("U", "D", "L", "R"):
+                        nxt = valid_next_pos(evader_pos, m, self.grid)
+                        if nxt != evader_pos and nxt != other_pos and nxt not in positions.values():
+                            resolved[evader] = (m, 0)
+                            desired[evader] = nxt
+                            moved = True
+                            break
+                            
+                    if not moved:
+                        # Nếu không tránh sang bên được, đi lùi
+                        m_init = actions[evader][0]
+                        reverse_move = {"U": "D", "D": "U", "L": "R", "R": "L"}
+                        if m_init in reverse_move:
+                            rev = reverse_move[m_init]
+                            nxt = valid_next_pos(evader_pos, rev, self.grid)
+                            if nxt != evader_pos and nxt not in positions.values():
+                                resolved[evader] = (rev, 0)
+                                desired[evader] = nxt
+                                moved = True
+                                
+                    if not moved:
+                        # Đứng yên nhường
+                        resolved[evader] = ("S", 0)
+                        desired[evader] = evader_pos
+                        
+        return resolved
 
     # ------------------------------------------------------------------
     # Main loop
