@@ -6,6 +6,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from env import DeliveryEnv, Order, Shipper, is_valid_cell, valid_next_pos, delivery_reward
 from solvers.solver import Solver
+from solvers.shared.detector import OnlineSurgeHotspotDetector
 
 
 Move = str
@@ -53,6 +54,15 @@ class GreedyBFS(Solver):
         
         # Cache khoảng cách từ (sx, sy) đến (ex, ey) của từng đơn hàng: order_id -> khoảng cách
         self._order_delivery_dist: Dict[int, int] = {}
+        
+        self.detector = OnlineSurgeHotspotDetector(
+            N=self.env.N,
+            C=self.env.C,
+            G=self.env.G,
+            T=self.env.T,
+            grid=self.grid
+        )
+        self._seen_order_ids: Set[int] = set()
 
     def _get_order_delivery_dist(self, order: Order) -> int:
         """Trả về khoảng cách từ pickup đến delivery của đơn hàng O(1) từ cache hoặc BFS."""
@@ -783,11 +793,35 @@ class GreedyBFS(Solver):
         # cargo_op = 1: env/Shipper.pickup_best() sẽ nhặt một đơn tốt nhất tại ô hiện tại.
         return (move, 1) if next_position == goal else (move, 0)
 
+    def _reposition_action(self, shipper: Shipper, orders: Dict[int, Order], current_t: int) -> Tuple[Action, Position]:
+        """
+        Di chuyển shipper trống về phía predicted hotspots khi có surge.
+        """
+        # 1. Chỉ reposition khi có surge và hotspots
+        if hasattr(self, "detector") and self.detector.is_surge and self.detector.predicted_hotspots:
+            # Chọn hotspot gần shipper nhất
+            best_hotspot = min(
+                self.detector.predicted_hotspots,
+                key=lambda hp: self._distance(shipper.position, hp)
+            )
+            if best_hotspot != shipper.position:
+                move, next_pos = self._move_towards(shipper, best_hotspot)
+                return (move, 0), best_hotspot
+                
+        # 2. Nếu không có surge hoặc hotspot, đứng yên để tránh lãng phí move cost
+        return ("S", 0), shipper.position
+
     def _decide_actions(self, obs: dict) -> Dict[int, Action]:
         self._score_cache = {}
         orders   = obs["orders"]
         shippers = obs["shippers"]
         current_t = obs.get("t", 0)
+        
+        # Cập nhật detector
+        current_order_ids = set(orders.keys())
+        new_order_ids = list(current_order_ids - self._seen_order_ids)
+        self._seen_order_ids.update(current_order_ids)
+        self.detector.update(current_t, new_order_ids, orders)
         
         self._all_shippers = shippers
         self._all_shipper_positions = {s.position for s in shippers}
@@ -851,9 +885,10 @@ class GreedyBFS(Solver):
             if not candidates_for_shippers:
                 # Các shipper còn lại không tìm được đơn hàng nào phù hợp
                 for shipper in unmatched_shippers:
-                    actions[shipper.id] = ("S", 0)
-                    goals[shipper.id] = shipper.position
-                    self._last_types[shipper.id] = "none"
+                    act, target_pos = self._reposition_action(shipper, orders, current_t)
+                    actions[shipper.id] = act
+                    goals[shipper.id] = target_pos
+                    self._last_types[shipper.id] = "reposition" if act[0] != "S" else "none"
                 break
                 
             # Sắp xếp theo score giảm dần (ưu tiên đơn mang lại reward/step cao nhất), sau đó là dist tăng dần
