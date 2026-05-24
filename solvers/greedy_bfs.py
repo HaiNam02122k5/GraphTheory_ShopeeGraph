@@ -33,99 +33,94 @@ class GreedyBFS(Solver):
 
     def __init__(self, env: DeliveryEnv):
         super().__init__(env)
-        self._distance_cache: Dict[Tuple[Position, Position], int] = {}
-        self._next_move_cache: Dict[Tuple[Position, Position], Move] = {}
+        # Tiền tính toán adjacency list
+        self._adj: Dict[Position, List[Tuple[Move, Position]]] = {}
+        self._build_adjacency_list()
+        
+        # Single-source BFS cache: start -> (dist_map, next_move_map)
+        self._bfs_cache: Dict[Position, Tuple[Dict[Position, int], Dict[Position, Move]]] = {}
+        
+        # Cache khoảng cách từ (sx, sy) đến (ex, ey) của từng đơn hàng: order_id -> khoảng cách
+        self._order_delivery_dist: Dict[int, int] = {}
 
-    # ------------------------------------------------------------------
-    # BFS utilities
-    # ------------------------------------------------------------------
-    def _neighbors(self, pos: Position) -> Iterable[Tuple[Move, Position]]:
-        """Liệt kê các ô kề hợp lệ bằng valid_next_pos() của env."""
-        for move in MOVES:
-            nxt = valid_next_pos(pos, move, self.grid)
-            if nxt != pos:
-                yield move, nxt
+    def _get_order_delivery_dist(self, order: Order) -> int:
+        """Trả về khoảng cách từ pickup đến delivery của đơn hàng O(1) từ cache hoặc BFS."""
+        if order.id in self._order_delivery_dist:
+            return self._order_delivery_dist[order.id]
+        dist = self._distance((order.sx, order.sy), (order.ex, order.ey))
+        self._order_delivery_dist[order.id] = dist
+        return dist
 
-    def _bfs_parents(
-        self,
-        start: Position,
-        goal: Position,
-    ) -> Optional[Dict[Position, Tuple[Optional[Position], Move]]]:
-        """Chạy BFS và lưu parent để lấy khoảng cách/next move."""
-        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
-            return None
+    def _build_adjacency_list(self):
+        """Xây dựng danh sách kề cho tất cả các ô trống hợp lệ trên bản đồ."""
+        N = len(self.grid)
+        for r in range(N):
+            for c in range(N):
+                pos = (r, c)
+                if is_valid_cell(pos, self.grid):
+                    neighbors = []
+                    for move in MOVES:
+                        nxt = valid_next_pos(pos, move, self.grid)
+                        if nxt != pos:
+                            neighbors.append((move, nxt))
+                    self._adj[pos] = neighbors
 
-        queue: deque[Position] = deque([start])
-        parent: Dict[Position, Tuple[Optional[Position], Move]] = {
-            start: (None, "S")
-        }
+    def _neighbors(self, pos: Position) -> List[Tuple[Move, Position]]:
+        """Trả về danh sách láng giềng kề hợp lệ O(1) từ cache."""
+        return self._adj.get(pos, [])
+
+    def _bfs_from(self, start: Position) -> Tuple[Dict[Position, int], Dict[Position, Move]]:
+        """Chạy BFS một nguồn (start) tính khoảng cách và next move tới tất cả các ô có thể đi đến."""
+        if start in self._bfs_cache:
+            return self._bfs_cache[start]
+
+        dist_map = {start: 0}
+        next_move_map = {start: "S"}
+
+        if not is_valid_cell(start, self.grid):
+            self._bfs_cache[start] = (dist_map, next_move_map)
+            return dist_map, next_move_map
+
+        queue = deque([start])
+        
+        # Thiết lập first move cho láng giềng trực tiếp của start
+        for move, nxt in self._neighbors(start):
+            dist_map[nxt] = 1
+            next_move_map[nxt] = move
+            queue.append(nxt)
 
         while queue:
-            current = queue.popleft()
-            if current == goal:
-                return parent
+            curr = queue.popleft()
+            d_curr = dist_map[curr]
+            m_curr = next_move_map[curr]
 
-            for move, nxt in self._neighbors(current):
-                if nxt in parent:
-                    continue
-                parent[nxt] = (current, move)
-                queue.append(nxt)
+            for move, nxt in self._neighbors(curr):
+                if nxt not in dist_map:
+                    dist_map[nxt] = d_curr + 1
+                    next_move_map[nxt] = m_curr
+                    queue.append(nxt)
 
-        return None
+        self._bfs_cache[start] = (dist_map, next_move_map)
+        return dist_map, next_move_map
 
     def _distance(self, start: Position, goal: Position) -> int:
-        """
-        Khoảng cách đường đi ngắn nhất trên grid có vật cản.
-        """
+        """Khoảng cách đường đi ngắn nhất giữa start và goal."""
         if start == goal:
             return 0
-
-        key = (start, goal)
-        if key in self._distance_cache:
-            return self._distance_cache[key]
-
-        parent = self._bfs_parents(start, goal)
-        if parent is None or goal not in parent:
-            self._distance_cache[key] = INF
-            return INF
-
-        distance = 0
-        current = goal
-        while current != start:
-            previous, _ = parent[current]
-            if previous is None:
-                self._distance_cache[key] = INF
-                return INF
-            current = previous
-            distance += 1
-
-        self._distance_cache[key] = distance
-        return distance
+        if start in self._bfs_cache:
+            return self._bfs_cache[start][0].get(goal, INF)
+        if goal in self._bfs_cache:
+            return self._bfs_cache[goal][0].get(start, INF)
+            
+        dist_map, _ = self._bfs_from(start)
+        return dist_map.get(goal, INF)
 
     def _next_move(self, start: Position, goal: Position) -> Move:
-        """Bước đi đầu tiên trên đường BFS từ start tới goal."""
+        """Bước đi tiếp theo đầu tiên từ start đi đến goal."""
         if start == goal:
             return "S"
-
-        key = (start, goal)
-        if key in self._next_move_cache:
-            return self._next_move_cache[key]
-
-        parent = self._bfs_parents(start, goal)
-        if parent is None or goal not in parent:
-            self._next_move_cache[key] = "S"
-            return "S"
-
-        current = goal
-        while True:
-            previous, move = parent[current]
-            if previous is None:
-                self._next_move_cache[key] = "S"
-                return "S"
-            if previous == start:
-                self._next_move_cache[key] = move
-                return move
-            current = previous
+        _, next_move_map = self._bfs_from(start)
+        return next_move_map.get(goal, "S")
 
     # ------------------------------------------------------------------
     # Policy: chọn đơn trong bag để giao
@@ -203,7 +198,7 @@ class GreedyBFS(Solver):
         Giá trị càng cao = đơn càng đáng nhặt.
         """
         dist_pickup  = self._distance(shipper.position, (order.sx, order.sy))
-        dist_deliver = self._distance((order.sx, order.sy), (order.ex, order.ey))
+        dist_deliver = self._get_order_delivery_dist(order)
         
         if dist_pickup >= INF or dist_deliver >= INF:
             return -INF
@@ -243,15 +238,27 @@ class GreedyBFS(Solver):
                 continue
             if not shipper.can_carry(order, orders):
                 continue
-            if self._distance(shipper.position, (order.sx, order.sy)) >= INF:
-                continue
             candidates.append(order)
 
         if not candidates:
             return None
 
+        # Sắp xếp theo Manhattan distance đến shipper.position và lấy 30 đơn gần nhất nếu map lớn
+        if len(self.grid) > 20:
+            candidates.sort(key=lambda o: abs(shipper.position[0] - o.sx) + abs(shipper.position[1] - o.sy))
+            candidates = candidates[:30]
+
+        # Lọc bằng BFS distance
+        valid_candidates = []
+        for order in candidates:
+            if self._distance(shipper.position, (order.sx, order.sy)) < INF:
+                valid_candidates.append(order)
+
+        if not valid_candidates:
+            return None
+
         return max(
-            candidates,
+            valid_candidates,
             key=lambda order: (
                 self._order_pickup_score(shipper, order, self.env.t, self.env.T),
                 -order.id,
@@ -344,7 +351,7 @@ class GreedyBFS(Solver):
         cand_delivery = (candidate.ex, candidate.ey)
 
         d_to_cpickup   = self._distance(shipper.position, cand_pickup)
-        d_cpickup_cdel = self._distance(cand_pickup, cand_delivery)
+        d_cpickup_cdel = self._get_order_delivery_dist(candidate)
 
         if d_to_cpickup >= INF or d_cpickup_cdel >= INF:
             return -INF
@@ -499,8 +506,17 @@ class GreedyBFS(Solver):
         candidates = [
             o for o in available_orders.values()
             if not o.picked and not o.delivered
-            and self._distance(shipper.position, (o.sx, o.sy)) < INF
         ]
+        if not candidates:
+            return None
+        
+        # Sắp xếp theo Manhattan distance đến shipper.position và lấy 30 đơn gần nhất nếu map lớn
+        if len(self.grid) > 20:
+            candidates.sort(key=lambda o: abs(shipper.position[0] - o.sx) + abs(shipper.position[1] - o.sy))
+            candidates = candidates[:30]
+        
+        # Lọc lại chỉ giữ các đơn thực sự đến được bằng BFS
+        candidates = [o for o in candidates if self._distance(shipper.position, (o.sx, o.sy)) < INF]
         if not candidates:
             return None
         
@@ -510,11 +526,19 @@ class GreedyBFS(Solver):
         remaining = list(candidates)
         
         while remaining and total_slots < shipper.K_max:
-            # Chọn đơn gần nhất từ vị trí hiện tại mà vẫn fit trong bag
+            valid_rem = [o for o in remaining 
+                         if total_weight + o.w <= shipper.W_max 
+                         and total_slots + 1 <= shipper.K_max]
+            if not valid_rem:
+                break
+                
+            # Sắp xếp theo Manhattan distance đến current_pos và lấy 15 đơn gần nhất nếu map lớn
+            if len(self.grid) > 20:
+                valid_rem.sort(key=lambda o: abs(current_pos[0] - o.sx) + abs(current_pos[1] - o.sy))
+                valid_rem = valid_rem[:15]
+            
             best = min(
-                (o for o in remaining 
-                if total_weight + o.w <= shipper.W_max 
-                and total_slots + 1 <= shipper.K_max),
+                valid_rem,
                 key=lambda o: self._distance(current_pos, (o.sx, o.sy)),
                 default=None
             )
@@ -525,7 +549,7 @@ class GreedyBFS(Solver):
             # Ước tính thời gian nếu thêm đơn này
             extra_dist = (
                 self._distance(current_pos, (best.sx, best.sy))
-                + self._distance((best.sx, best.sy), (best.ex, best.ey))
+                + self._get_order_delivery_dist(best)
             )
             t_estimated = current_t + extra_dist
             if delivery_reward(best, t_estimated, self.env.T) > 0:  # vẫn có reward
@@ -556,10 +580,19 @@ class GreedyBFS(Solver):
         remaining = [o for o in available_orders.values() if o.id != start_order.id]
         
         while remaining and total_slots < shipper.K_max:
+            valid_rem = [o for o in remaining 
+                         if total_weight + o.w <= shipper.W_max 
+                         and total_slots + 1 <= shipper.K_max]
+            if not valid_rem:
+                break
+                
+            # Sắp xếp theo Manhattan distance đến current_pos và lấy 15 đơn gần nhất nếu map lớn
+            if len(self.grid) > 20:
+                valid_rem.sort(key=lambda o: abs(current_pos[0] - o.sx) + abs(current_pos[1] - o.sy))
+                valid_rem = valid_rem[:15]
+            
             best = min(
-                (o for o in remaining 
-                if total_weight + o.w <= shipper.W_max 
-                and total_slots + 1 <= shipper.K_max),
+                valid_rem,
                 key=lambda o: self._distance(current_pos, (o.sx, o.sy)),
                 default=None
             )
@@ -568,7 +601,7 @@ class GreedyBFS(Solver):
                 
             dist_to_start = self._distance(shipper.position, (start_order.sx, start_order.sy))
             dist_to_best = self._distance(current_pos, (best.sx, best.sy))
-            dist_best_delivery = self._distance((best.sx, best.sy), (best.ex, best.ey))
+            dist_best_delivery = self._get_order_delivery_dist(best)
             
             t_estimated = current_t + dist_to_start + dist_to_best + dist_best_delivery
             if delivery_reward(best, t_estimated, self.env.T) > 0:
