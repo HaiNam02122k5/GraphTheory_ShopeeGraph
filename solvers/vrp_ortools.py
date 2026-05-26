@@ -78,6 +78,16 @@ class VRPOrToolsSolver(Solver):
             REPLAN_INTERVAL_LARGE if env.N >= 18 else REPLAN_INTERVAL_SMALL
         )
         self._prev_pending_count: int = 0
+        if self.env.N <= 22:
+            self.max_delivery_delay = 10
+        elif self.env.N <= 25:
+            self.max_delivery_delay = 5
+        elif self.env.N <= 30:
+            self.max_delivery_delay = -5
+        elif self.env.N <= 35:
+            self.max_delivery_delay = -8
+        else:
+            self.max_delivery_delay = -10
 
     # -----------------------------------------------------------------------
     # BFS utilities
@@ -101,6 +111,44 @@ class VRPOrToolsSolver(Solver):
         d1 = self._dist(from_pos, (order.sx, order.sy))
         d2 = self._dist((order.sx, order.sy), (order.ex, order.ey))
         return delivery_reward(order, obs_t + d1 + d2, self.env.T)
+
+    def _pickup_score(
+        self,
+        from_pos: Position,
+        order: Order,
+        obs_t: int,
+        elapsed: int = 0,
+    ) -> float:
+        d_pick = self._dist(from_pos, (order.sx, order.sy))
+        d_drop = self._dist((order.sx, order.sy), (order.ex, order.ey))
+        if d_pick >= INF or d_drop >= INF:
+            return 0.0
+        eta_delivery = obs_t + elapsed + d_pick + d_drop
+        if eta_delivery - order.et > self.max_delivery_delay:
+            return 0.0
+        reward = delivery_reward(order, eta_delivery, self.env.T)
+        urgency = 0.0
+        if eta_delivery <= order.et:
+            urgency = 1.0 / max(order.et - obs_t, 1)
+        return reward / (d_pick + d_drop + 1) + urgency * 10.0 + 0.05 * order.p
+
+    def _select_delivery_order(self, shipper: Shipper, orders: Dict[int, Order]) -> Optional[Order]:
+        carried = [
+            orders[oid]
+            for oid in shipper.bag
+            if oid in orders and not orders[oid].delivered
+        ]
+        if not carried:
+            return None
+
+        obs_t = self.env.t
+        def key(order: Order):
+            d = self._dist(shipper.position, (order.ex, order.ey))
+            if obs_t + d <= order.et:
+                return (0, order.et, d, -order.p, order.id)
+            return (1, d, order.et, -order.p, order.id)
+
+        return min(carried, key=key)
 
     # -----------------------------------------------------------------------
     # Distance matrix builder
@@ -146,14 +194,10 @@ class VRPOrToolsSolver(Solver):
                 if oid in orders and not orders[oid].delivered
             ]
             if carried:
-                best = min(
-                    carried,
-                    key=lambda o: (
-                        self._dist(s.position, (o.ex, o.ey)),
-                        o.et,
-                        -o.p,
-                    ),
-                )
+                best = self._select_delivery_order(s, orders)
+                if best is None:
+                    actions[s.id] = ("S", 0)
+                    continue
                 goal = (best.ex, best.ey)
                 mv = self._path(s.position, goal)
                 move = mv[0] if mv else "S"
@@ -170,19 +214,17 @@ class VRPOrToolsSolver(Solver):
                 if d >= INF:
                     continue
                 d2 = self._dist((o.sx, o.sy), (o.ex, o.ey))
-                if obs_t + d + d2 >= o.et + self.env.T:
+                if obs_t + d + d2 - o.et > self.max_delivery_delay:
                     continue
-                cands.append(o)
+                score = self._pickup_score(s.position, o, obs_t)
+                if score <= 0.0:
+                    continue
+                cands.append((score, d, o))
 
             if cands:
-                best = min(
+                _, _, best = max(
                     cands,
-                    key=lambda o: (
-                        self._dist(s.position, (o.sx, o.sy)),
-                        -o.p,
-                        o.et,
-                        o.id,
-                    ),
+                    key=lambda item: (item[0], -item[1], -item[2].id),
                 )
                 reserved.add(best.id)
                 goal = (best.sx, best.sy)
@@ -690,10 +732,9 @@ class VRPOrToolsSolver(Solver):
             if oid in orders and not orders[oid].delivered
         ]
         if carried:
-            best = min(
-                carried,
-                key=lambda o: (self._dist(s.position, (o.ex, o.ey)), o.et, -o.p),
-            )
+            best = self._select_delivery_order(s, orders)
+            if best is None:
+                return ("S", 0)
             goal = (best.ex, best.ey)
             return self._navigate_to(s.position, goal, cargo_op_at_goal=2)
 
@@ -746,17 +787,17 @@ class VRPOrToolsSolver(Solver):
                 continue
             # Deadline filter: bỏ đơn chắc chắn reward = 0
             d_deliver = self._dist((o.sx, o.sy), (o.ex, o.ey))
-            if obs_t + d_pickup + d_deliver >= o.et + self.env.T:
+            if obs_t + d_pickup + d_deliver - o.et > self.max_delivery_delay:
                 continue
-            cands.append(o)
+            score = self._pickup_score(s.position, o, obs_t)
+            if score <= 0.0:
+                continue
+            cands.append((score, d_pickup, o))
 
         if cands:
-            best = min(
+            _, _, best = max(
                 cands,
-                key=lambda o: (
-                    self._dist(s.position, (o.sx, o.sy)),
-                    -o.p, o.et, o.id,
-                ),
+                key=lambda item: (item[0], -item[1], -item[2].id),
             )
             self._reserved.add(best.id)
 
@@ -778,7 +819,7 @@ class VRPOrToolsSolver(Solver):
                 if d_via - d_direct > 3:  # BATCH_DETOUR_LIMIT
                     continue
                 d_deliver2 = self._dist((o2.sx, o2.sy), (o2.ex, o2.ey))
-                if obs_t + d_via + d_deliver2 >= o2.et + self.env.T:
+                if obs_t + d_via + d_deliver2 - o2.et > self.max_delivery_delay:
                     continue
                 self._reserved.add(o2.id)
                 w_carried += o2.w

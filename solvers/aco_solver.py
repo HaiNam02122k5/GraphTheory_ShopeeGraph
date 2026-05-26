@@ -23,7 +23,7 @@ REPLAN_INTERVAL_LARGE = 20
 MAX_ACTIVE_ORDERS = 45
 MAX_STOPS_SMALL = 4
 MAX_STOPS_LARGE = 8
-MIN_EXPECTED_REWARD = 0.5
+MIN_EXPECTED_REWARD = 0.15
 
 ACO_ALPHA = 1.0
 ACO_BETA = 2.4
@@ -59,6 +59,16 @@ class ACOSolver(Solver):
         )
         seed = 7919 + env.N * 101 + env.C * 17 + env.G
         self._rng = random.Random(seed)
+        if self.env.N <= 22:
+            self.max_delivery_delay = 10
+        elif self.env.N <= 25:
+            self.max_delivery_delay = 5
+        elif self.env.N <= 30:
+            self.max_delivery_delay = -5
+        elif self.env.N <= 35:
+            self.max_delivery_delay = -8
+        else:
+            self.max_delivery_delay = -10
 
     # ------------------------------------------------------------------
     # BFS helpers (Tăng tốc bởi GPU PathFinder)
@@ -85,7 +95,9 @@ class ACOSolver(Solver):
         return 12
 
     def _route_limit(self) -> int:
-        return MAX_STOPS_SMALL if 12 <= self.env.N < 18 else MAX_STOPS_LARGE
+        if self.env.N < 12:
+            return 4
+        return 8
 
     def _exploit_probability(self) -> float:
         if self.env.N <= 10:
@@ -102,6 +114,47 @@ class ACOSolver(Solver):
         if d_pick >= INF or d_drop >= INF:
             return 0.0
         return delivery_reward(order, obs_t + d_pick + d_drop, self.env.T)
+
+    def _pickup_score(
+        self,
+        from_pos: Position,
+        order: Order,
+        obs_t: int,
+        elapsed: int = 0,
+    ) -> float:
+        d_pick = self._dist(from_pos, (order.sx, order.sy))
+        d_drop = self._dist((order.sx, order.sy), (order.ex, order.ey))
+        if d_pick >= INF or d_drop >= INF:
+            return 0.0
+        eta_delivery = obs_t + elapsed + d_pick + d_drop
+        reward = delivery_reward(order, eta_delivery, self.env.T)
+        if eta_delivery - order.et > self.max_delivery_delay:
+            return 0.0
+        urgency = 0.0
+        if eta_delivery <= order.et:
+            urgency = 1.0 / max(order.et - obs_t, 1)
+        return reward / (d_pick + d_drop + 1) + urgency * 10.0 + 0.05 * order.p
+
+    def _select_delivery_order(self, shipper: Shipper, orders: Dict[int, Order]) -> Optional[Order]:
+        carried = [
+            orders[oid]
+            for oid in shipper.bag
+            if oid in orders and not orders[oid].delivered
+        ]
+        if not carried:
+            return None
+
+        obs_t = self.env.t
+        return min(
+            carried,
+            key=lambda o: (
+                0 if obs_t + self._dist(shipper.position, (o.ex, o.ey)) <= o.et else 1,
+                o.et if obs_t + self._dist(shipper.position, (o.ex, o.ey)) <= o.et else self._dist(shipper.position, (o.ex, o.ey)),
+                self._dist(shipper.position, (o.ex, o.ey)),
+                -o.p,
+                o.id,
+            ),
+        )
 
     def _active_orders(self, obs: dict) -> List[Order]:
         orders: Dict[int, Order] = obs["orders"]
@@ -120,22 +173,25 @@ class ACOSolver(Solver):
                 continue
             candidates.append(order)
 
+        def _heuristic_score(o: Order) -> float:
+            nearest_p = min(
+                (s.position for s in shippers),
+                key=lambda p: self._dist(p, (o.sx, o.sy))
+            )
+            dist = self._dist(nearest_p, (o.sx, o.sy)) + 1
+            reward = self._expected_reward(nearest_p, o, obs_t)
+            return reward / dist
+
         candidates.sort(
             key=lambda o: (
-                -self._expected_reward(
-                    min(
-                        (s.position for s in shippers),
-                        key=lambda p: self._dist(p, (o.sx, o.sy)),
-                    ),
-                    o,
-                    obs_t,
-                ),
+                -_heuristic_score(o),
                 o.et,
                 -o.p,
                 o.id,
             )
         )
-        return candidates[:MAX_ACTIVE_ORDERS]
+        max_active = max(45, self.env.C * 8)
+        return candidates[:max_active]
 
     def _node_id(self, stop: RouteStop) -> int:
         _, op, oid = stop
@@ -187,41 +243,41 @@ class ACOSolver(Solver):
             urgency += min(1.0, (arrival - order.et) / max(self.env.T, 1))
         return max(0.001, (reward * urgency) / (d + 1))
 
-    def _select_candidate(
+    def _select_parallel_candidate(
         self,
-        candidates: List[Tuple[RouteStop, Order, int, float, EdgeKey]],
+        candidates: List[Tuple[int, RouteStop, Order, int, float, EdgeKey]],
         pheromone: Dict[EdgeKey, float],
         exploit: bool,
-    ) -> Tuple[RouteStop, Order, int, float, EdgeKey]:
+    ) -> int:
         if exploit:
             return max(
-                candidates,
-                key=lambda item: (
-                    pheromone.get(item[4], TAU0) ** ACO_ALPHA
-                    * item[3] ** ACO_BETA,
-                    item[3],
-                    -item[2],
-                    -item[1].id,
+                range(len(candidates)),
+                key=lambda idx: (
+                    pheromone.get(candidates[idx][5], TAU0) ** ACO_ALPHA
+                    * candidates[idx][4] ** ACO_BETA,
+                    candidates[idx][4],
+                    -candidates[idx][3],
+                    -candidates[idx][2].id,
                 ),
             )
 
         weights: List[float] = []
         total = 0.0
-        for _, _, _, eta, edge in candidates:
+        for _, _, _, _, eta, edge in candidates:
             weight = pheromone.get(edge, TAU0) ** ACO_ALPHA * eta ** ACO_BETA
             weights.append(weight)
             total += weight
 
         if total <= 0:
-            return self._rng.choice(candidates)
+            return self._rng.choice(range(len(candidates)))
 
         pick = self._rng.random() * total
         acc = 0.0
-        for item, weight in zip(candidates, weights):
+        for idx, weight in enumerate(weights):
             acc += weight
             if acc >= pick:
-                return item
-        return candidates[-1]
+                return idx
+        return len(candidates) - 1
 
     def _construct_solution(
         self,
@@ -235,22 +291,36 @@ class ACOSolver(Solver):
         obs_t = obs["t"]
 
         assigned: Set[int] = set()
-        routes: Dict[int, List[RouteStop]] = {}
-        shipper_order = sorted(shippers, key=lambda s: (len(s.bag), s.id))
+        routes: Dict[int, List[RouteStop]] = {s.id: [] for s in shippers}
 
-        for shipper in shipper_order:
-            pos = shipper.position
-            elapsed = 0
-            from_node = -(shipper.id + 1)
-            bag: List[int] = [
-                oid for oid in shipper.bag
-                if oid in orders and not orders[oid].delivered
-            ]
-            carried_weight = sum(orders[oid].w for oid in bag if oid in orders)
-            route: List[RouteStop] = []
+        state: Dict[int, dict] = {}
+        for s in shippers:
+            bag = [oid for oid in s.bag if oid in orders and not orders[oid].delivered]
+            state[s.id] = {
+                "pos": s.position,
+                "elapsed": 0,
+                "from_node": -(s.id + 1),
+                "bag": bag,
+                "carried_weight": sum(orders[oid].w for oid in bag if oid in orders),
+                "finished": False,
+                "K_max": s.K_max,
+                "W_max": s.W_max,
+            }
 
-            while len(route) < self._route_limit():
-                candidates: List[Tuple[RouteStop, Order, int, float, EdgeKey]] = []
+        while True:
+            candidates: List[Tuple[int, RouteStop, Order, int, float, EdgeKey]] = []
+
+            for sid, s_state in state.items():
+                if s_state["finished"] or len(routes[sid]) >= self._route_limit():
+                    continue
+
+                pos = s_state["pos"]
+                elapsed = s_state["elapsed"]
+                from_node = s_state["from_node"]
+                bag = s_state["bag"]
+                carried_weight = s_state["carried_weight"]
+                K_max = s_state["K_max"]
+                W_max = s_state["W_max"]
 
                 for oid in list(bag):
                     order = orders.get(oid)
@@ -260,48 +330,45 @@ class ACOSolver(Solver):
                     d = self._dist(pos, stop[0])
                     eta = self._eta_delivery(order, elapsed, obs_t, d)
                     if eta > 0:
-                        candidates.append((stop, order, d, eta, self._edge_key(from_node, stop)))
+                        candidates.append((sid, stop, order, d, eta, self._edge_key(from_node, stop)))
 
-                if len(bag) < shipper.K_max:
+                if len(bag) < K_max:
                     for order in active_orders:
                         if order.id in assigned or order.id in bag:
                             continue
                         if order.picked or order.delivered:
                             continue
-                        if carried_weight + order.w > shipper.W_max:
+                        if carried_weight + order.w > W_max:
                             continue
                         stop = ((order.sx, order.sy), 1, order.id)
                         d_pick = self._dist(pos, stop[0])
                         eta = self._eta_pickup(pos, order, elapsed, obs_t, d_pick)
                         if eta > 0:
-                            candidates.append((stop, order, d_pick, eta, self._edge_key(from_node, stop)))
+                            candidates.append((sid, stop, order, d_pick, eta, self._edge_key(from_node, stop)))
 
-                if not candidates:
-                    break
+            if not candidates:
+                break
 
-                stop, order, travel, _, _ = self._select_candidate(
-                    candidates,
-                    pheromone,
-                    exploit=exploit,
-                )
-                route.append(stop)
-                pos = stop[0]
-                elapsed += travel
-                from_node = self._node_id(stop)
+            selected_idx = self._select_parallel_candidate(candidates, pheromone, exploit)
+            sid, stop, order, travel, _, edge_key = candidates[selected_idx]
 
-                if stop[1] == 1:
-                    assigned.add(order.id)
-                    bag.append(order.id)
-                    carried_weight += order.w
-                else:
-                    if order.id in bag:
-                        bag.remove(order.id)
-                    carried_weight = max(0.0, carried_weight - order.w)
+            s_state = state[sid]
+            routes[sid].append(stop)
+            s_state["pos"] = stop[0]
+            s_state["elapsed"] += travel
+            s_state["from_node"] = self._node_id(stop)
 
-                if elapsed >= self.env.T:
-                    break
+            if stop[1] == 1:
+                assigned.add(order.id)
+                s_state["bag"].append(order.id)
+                s_state["carried_weight"] += order.w
+            else:
+                if order.id in s_state["bag"]:
+                    s_state["bag"].remove(order.id)
+                s_state["carried_weight"] = max(0.0, s_state["carried_weight"] - order.w)
 
-            routes[shipper.id] = route
+            if s_state["elapsed"] >= self.env.T:
+                s_state["finished"] = True
 
         return routes
 
@@ -439,7 +506,7 @@ class ACOSolver(Solver):
     def _greedy_pick(self, shipper: Shipper, obs: dict) -> Action:
         orders: Dict[int, Order] = obs["orders"]
         obs_t = obs["t"]
-        candidates: List[Order] = []
+        candidates: List[Tuple[float, int, Order]] = []
 
         for order in orders.values():
             if order.picked or order.delivered:
@@ -452,23 +519,47 @@ class ACOSolver(Solver):
             d_drop = self._dist((order.sx, order.sy), (order.ex, order.ey))
             if d_pick >= INF or d_drop >= INF:
                 continue
-            if obs_t + d_pick + d_drop >= order.et + self.env.T:
+            if obs_t + d_pick + d_drop - order.et > self.max_delivery_delay:
                 continue
-            candidates.append(order)
+            score = self._pickup_score(shipper.position, order, obs_t)
+            if score <= 0.0:
+                continue
+            candidates.append((score, d_pick, order))
 
         if not candidates:
             return ("S", 0)
 
-        best = min(
+        _, _, best = max(
             candidates,
-            key=lambda o: (
-                self._dist(shipper.position, (o.sx, o.sy)),
-                -o.p,
-                o.et,
-                o.id,
-            ),
+            key=lambda item: (item[0], -item[1], -item[2].id),
         )
         self._reserved.add(best.id)
+
+        remaining_slots = shipper.K_max - len(shipper.bag) - 1
+        w_carried = sum(orders[oid].w for oid in shipper.bag if oid in orders) + best.w
+        d_direct = self._dist(shipper.position, (best.sx, best.sy))
+        for other in orders.values():
+            if remaining_slots <= 0:
+                break
+            if other.id == best.id or other.id in self._reserved:
+                continue
+            if other.picked or other.delivered:
+                continue
+            if w_carried + other.w > shipper.W_max:
+                continue
+            d_via = (
+                self._dist(shipper.position, (other.sx, other.sy))
+                + self._dist((other.sx, other.sy), (best.sx, best.sy))
+            )
+            if d_via - d_direct > 3:
+                continue
+            d_drop = self._dist((other.sx, other.sy), (other.ex, other.ey))
+            if obs_t + d_via + d_drop - other.et > self.max_delivery_delay:
+                continue
+            self._reserved.add(other.id)
+            w_carried += other.w
+            remaining_slots -= 1
+
         return self._navigate_to(shipper.position, (best.sx, best.sy), 1)
 
     def _step_action(self, shipper: Shipper, obs: dict) -> Action:
@@ -491,7 +582,9 @@ class ACOSolver(Solver):
                     if not order.picked and not order.delivered and shipper.can_carry(order, orders):
                         greedy_dist = min(greedy_dist, self._dist(shipper.position, (order.sx, order.sy)))
                 
-                if self._dist(shipper.position, goal) <= max(greedy_dist * 1.5, greedy_dist + 3):
+                bypass_factor = 2.2 if self.env.N >= 25 else 3.5
+                bypass_offset = 8 if self.env.N >= 25 else 15
+                if self._dist(shipper.position, goal) <= max(greedy_dist * bypass_factor, greedy_dist + bypass_offset):
                     return self._navigate_to(shipper.position, goal, op)
 
         carried = [
@@ -500,10 +593,9 @@ class ACOSolver(Solver):
             if oid in orders and not orders[oid].delivered
         ]
         if carried:
-            best = min(
-                carried,
-                key=lambda o: (self._dist(shipper.position, (o.ex, o.ey)), o.et, -o.p, o.id),
-            )
+            best = self._select_delivery_order(shipper, orders)
+            if best is None:
+                return ("S", 0)
             return self._navigate_to(shipper.position, (best.ex, best.ey), 2)
 
         return self._greedy_pick(shipper, obs)

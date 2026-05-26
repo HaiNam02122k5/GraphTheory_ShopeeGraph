@@ -4,7 +4,7 @@ import heapq
 from collections import deque
 from typing import Dict, List, Tuple, Set, Optional, Any
 
-from env import DeliveryEnv, Order, Shipper, valid_next_pos
+from env import DeliveryEnv, Order, Shipper, valid_next_pos, delivery_reward
 from solvers.solver import default_result
 from solvers.aco_solver import ACOSolver, INF
 
@@ -29,6 +29,594 @@ class MAPDCBSSolver(ACOSolver):
         self.window_size = 12
         self.cbs_max_nodes = 30
         self.cbs_time_limit = 0.15
+        self._cbs_mode = "full"
+        self._group_cbs_max_size = 6
+        self._aco_iterations_override: Optional[int] = None
+        self._max_active_override: Optional[int] = None
+        self._route_limit_override: Optional[int] = None
+        self._strict_deadline_mode = False
+        self._stats = {
+            "aco_calls": 0,
+            "cbs_calls": 0,
+            "cbs_success": 0,
+            "cbs_failed": 0,
+            "group_cbs_calls": 0,
+            "local_steps": 0,
+        }
+        self._order_delivery_dist: Dict[int, int] = {}
+        if self.env.N <= 22:
+            self.max_delivery_delay = 10
+        elif self.env.N <= 25:
+            self.max_delivery_delay = 5
+        elif self.env.N <= 30:
+            self.max_delivery_delay = -5
+        elif self.env.N <= 35:
+            self.max_delivery_delay = -8
+        else:
+            self.max_delivery_delay = -10
+        self._configure_runtime_budget()
+
+    def _configure_runtime_budget(self) -> None:
+        if self.env.G >= 1000 or self.env.C >= 20:
+            self.window_size = 6
+            self.cbs_max_nodes = 10
+            self.cbs_time_limit = 0.04
+            self._replan_interval = 18
+            self._aco_iterations_override = 12
+            self._max_active_override = 110
+            self._route_limit_override = 7
+            self._cbs_mode = "group"
+            self._group_cbs_max_size = 6
+            self._strict_deadline_mode = True
+        elif self.env.N >= 100:
+            self.window_size = 6
+            self.cbs_max_nodes = 8
+            self.cbs_time_limit = 0.025
+            self._replan_interval = 50
+            self._aco_iterations_override = 4
+            self._max_active_override = 45
+            self._route_limit_override = 5
+            self._cbs_mode = "group"
+            self._group_cbs_max_size = 5
+        elif self.env.N >= 50:
+            self.window_size = 8
+            self.cbs_max_nodes = 12
+            self.cbs_time_limit = 0.05
+            self._replan_interval = 35
+            self._aco_iterations_override = 6
+            self._max_active_override = 55
+            self._route_limit_override = 6
+            self._cbs_mode = "group"
+            self._group_cbs_max_size = 6
+
+    def _n_iterations(self) -> int:
+        if self._aco_iterations_override is not None:
+            return self._aco_iterations_override
+        return super()._n_iterations()
+
+    def _route_limit(self) -> int:
+        if self._route_limit_override is not None:
+            return self._route_limit_override
+        return super()._route_limit()
+
+    def _pickup_candidate_limit(self) -> int:
+        if self.env.G >= 1000 or self.env.C >= 20:
+            return 60
+        if self.env.N >= 100:
+            return 18
+        if self.env.N >= 50:
+            return 24
+        return 30
+
+    def _batch_candidate_limit(self) -> int:
+        if self.env.G >= 1000 or self.env.C >= 20:
+            return 30
+        if self.env.N >= 100:
+            return 8
+        if self.env.N >= 50:
+            return 10
+        return 15
+
+    def _get_order_delivery_dist(self, order: Order) -> int:
+        if order.id in self._order_delivery_dist:
+            return self._order_delivery_dist[order.id]
+        dist = self._dist((order.sx, order.sy), (order.ex, order.ey))
+        self._order_delivery_dist[order.id] = dist
+        return dist
+
+    def _order_pickup_score(self, shipper: Shipper, order: Order, current_t: int, T: int) -> float:
+        dist_pickup = self._dist(shipper.position, (order.sx, order.sy))
+        dist_deliver = self._get_order_delivery_dist(order)
+        
+        if dist_pickup >= INF or dist_deliver >= INF:
+            return -INF
+        
+        t_estimated_delivery = current_t + dist_pickup + dist_deliver
+        expected_reward = delivery_reward(order, t_estimated_delivery, T)
+        
+        expiry_mult = 1.0
+        total_steps = max(dist_pickup + dist_deliver, 1)
+        
+        if t_estimated_delivery > order.et:
+            urgency = 0.0
+        else:
+            time_slack = max(order.et - current_t, 1)
+            urgency = 1.0 / time_slack
+        
+        deadline_penalty = 0.0
+        if self._strict_deadline_mode:
+            lateness = t_estimated_delivery - order.et
+            if lateness > self.max_delivery_delay:
+                deadline_penalty = lateness * 0.25
+
+        return (expected_reward * expiry_mult) / total_steps + urgency * 10.0 - deadline_penalty
+
+    def _select_pickup_v1(
+        self,
+        shipper: Shipper,
+        orders: Dict[int, Order],
+        reserved_order_ids: Set[int],
+        current_t: int,
+    ) -> Optional[Order]:
+        candidates: List[Order] = []
+
+        for order in orders.values():
+            if order.id in reserved_order_ids:
+                continue
+            if not shipper.can_carry(order, orders):
+                continue
+            candidates.append(order)
+
+        if not candidates:
+            return None
+
+        if len(self.grid) > 20:
+            candidates.sort(key=lambda o: abs(shipper.position[0] - o.sx) + abs(shipper.position[1] - o.sy))
+            candidates = candidates[:self._pickup_candidate_limit()]
+
+        valid_candidates = []
+        for order in candidates:
+            if self._dist(shipper.position, (order.sx, order.sy)) < INF:
+                valid_candidates.append(order)
+
+        if not valid_candidates:
+            return None
+
+        if self._strict_deadline_mode:
+            feasible_candidates = []
+            fallback_candidates = []
+            for order in valid_candidates:
+                d_pick = self._dist(shipper.position, (order.sx, order.sy))
+                d_drop = self._get_order_delivery_dist(order)
+                eta = current_t + d_pick + d_drop + 2
+                score = self._order_pickup_score(shipper, order, current_t, self.env.T)
+                if eta - order.et <= self.max_delivery_delay:
+                    feasible_candidates.append((score, order))
+                elif score > 0:
+                    fallback_candidates.append((score, order))
+
+            scored = feasible_candidates or fallback_candidates
+            if not scored:
+                return None
+            return max(scored, key=lambda item: (item[0], -item[1].id))[1]
+
+        return max(
+            valid_candidates,
+            key=lambda order: (
+                self._order_pickup_score(shipper, order, current_t, self.env.T),
+                -order.id,
+            ),
+        )
+
+    def _estimate_bag_reward(
+        self,
+        start_pos: Position,
+        bag_orders: List[Order],
+        current_t: int,
+        T: int,
+    ) -> float:
+        if not bag_orders:
+            return 0.0
+
+        total_reward = 0.0
+        pos = start_pos
+        t = current_t
+
+        for order in sorted(bag_orders, key=lambda o: o.et):
+            goal = (order.ex, order.ey)
+            d = self._dist(pos, goal)
+            if d >= INF:
+                continue
+            t += d
+            total_reward += delivery_reward(order, t, T)
+            pos = goal
+
+        return total_reward
+
+    def _estimate_finish_time(
+        self,
+        start_pos: Position,
+        bag_orders: List[Order],
+        current_t: int,
+    ) -> int:
+        pos = start_pos
+        t = current_t
+        for order in sorted(bag_orders, key=lambda o: o.et):
+            d = self._dist(pos, (order.ex, order.ey))
+            if d < INF:
+                t += d
+                pos = (order.ex, order.ey)
+        return t
+
+    def _estimate_last_position(
+        self,
+        start_pos: Position,
+        bag_orders: List[Order],
+    ) -> Position:
+        pos = start_pos
+        for order in sorted(bag_orders, key=lambda o: o.et):
+            d = self._dist(pos, (order.ex, order.ey))
+            if d < INF:
+                pos = (order.ex, order.ey)
+        return pos
+
+    def _estimate_route_times(
+        self,
+        shipper_pos: Position,
+        pickup_orders: List[Order],
+        bag_orders: List[Order],
+        start_t: int,
+    ) -> Dict[int, int]:
+        t = start_t
+        curr = shipper_pos
+
+        for order in pickup_orders:
+            dist = self._dist(curr, (order.sx, order.sy))
+            if dist >= INF:
+                return {}
+            t += dist + 1
+            curr = (order.sx, order.sy)
+
+        remaining = list(pickup_orders) + list(bag_orders)
+        delivery_times: Dict[int, int] = {}
+        while remaining:
+            best = min(
+                remaining,
+                key=lambda o: (
+                    0 if t + self._dist(curr, (o.ex, o.ey)) <= o.et else 1,
+                    o.et,
+                    self._dist(curr, (o.ex, o.ey)),
+                    -o.p,
+                    o.id,
+                ),
+            )
+            dist = self._dist(curr, (best.ex, best.ey))
+            if dist >= INF:
+                return {}
+            t += dist + 1
+            delivery_times[best.id] = t
+            curr = (best.ex, best.ey)
+            remaining.remove(best)
+
+        return delivery_times
+
+    def _evaluate_opportunistic_pickup(
+        self,
+        shipper: Shipper,
+        candidate: Order,
+        current_t: int,
+        orders: Dict[int, Order],
+    ) -> float:
+        T = self.env.T
+        bag_orders = [
+            orders[oid] for oid in shipper.bag
+            if oid in orders and not orders[oid].delivered
+        ]
+
+        cand_pickup = (candidate.sx, candidate.sy)
+        cand_delivery = (candidate.ex, candidate.ey)
+
+        d_to_cpickup = self._dist(shipper.position, cand_pickup)
+        d_cpickup_cdel = self._get_order_delivery_dist(candidate)
+
+        if d_to_cpickup >= INF or d_cpickup_cdel >= INF:
+            return -INF
+
+        baseline_reward = self._estimate_bag_reward(
+            shipper.position, bag_orders, current_t, T
+        )
+
+        pos_after_pickup = cand_pickup
+        t_after_pickup = current_t + d_to_cpickup
+
+        bag_reward_after_pickup = self._estimate_bag_reward(
+            pos_after_pickup, bag_orders, t_after_pickup, T
+        )
+
+        t_finish_bag = self._estimate_finish_time(
+            pos_after_pickup, bag_orders, t_after_pickup
+        )
+        last_bag_pos = self._estimate_last_position(pos_after_pickup, bag_orders)
+        d_last_to_cdel = self._dist(last_bag_pos, cand_delivery)
+        t_cand_delivery = t_finish_bag + d_last_to_cdel
+        reward_cand = delivery_reward(candidate, t_cand_delivery, T)
+
+        w_extra = candidate.w
+        extra_move_cost = d_to_cpickup * (-0.01 * w_extra / max(shipper.W_max, 1.0))
+
+        new_total = bag_reward_after_pickup + reward_cand + extra_move_cost
+        net_gain = new_total - baseline_reward
+
+        return net_gain
+
+    def _find_opportunistic_pickup(
+        self,
+        shipper: Shipper,
+        orders: Dict[int, Order],
+        reserved_order_ids: Set[int],
+        current_t: int,
+    ) -> Optional[Order]:
+        current_weight = sum(
+            orders[oid].w for oid in shipper.bag if oid in orders
+        )
+        if (len(shipper.bag) >= shipper.K_max
+                or current_weight >= shipper.W_max):
+            return None
+
+        best_order: Optional[Order] = None
+        best_gain = 0.0
+
+        for order in orders.values():
+            if order.picked or order.delivered:
+                continue
+            if order.id in reserved_order_ids:
+                continue
+            if not shipper.can_carry(order, orders):
+                continue
+            if order.et <= current_t:
+                continue
+
+            gain = self._evaluate_opportunistic_pickup(
+                shipper, order, current_t, orders
+            )
+            if gain > best_gain:
+                best_gain = gain
+                best_order = order
+
+        return best_order
+
+    def _plan_multi_pickup_route(self, shipper: Shipper, available_orders: Dict[int, Order], current_t: int) -> Optional[Order]:
+        candidates = [
+            o for o in available_orders.values()
+            if not o.picked and not o.delivered
+        ]
+        if not candidates:
+            return None
+        
+        if len(self.grid) > 20:
+            candidates.sort(key=lambda o: abs(shipper.position[0] - o.sx) + abs(shipper.position[1] - o.sy))
+            candidates = candidates[:self._pickup_candidate_limit()]
+        
+        candidates = [o for o in candidates if self._dist(shipper.position, (o.sx, o.sy)) < INF]
+        if not candidates:
+            return None
+        
+        route, total_weight, total_slots = [], 0.0, 0
+        current_pos = shipper.position
+        remaining = list(candidates)
+        
+        while remaining and total_slots < shipper.K_max:
+            valid_rem = [o for o in remaining 
+                         if total_weight + o.w <= shipper.W_max 
+                         and total_slots + 1 <= shipper.K_max]
+            if not valid_rem:
+                break
+                
+            if len(self.grid) > 20:
+                valid_rem.sort(key=lambda o: abs(current_pos[0] - o.sx) + abs(current_pos[1] - o.sy))
+                valid_rem = valid_rem[:self._batch_candidate_limit()]
+            
+            found_next = False
+            for best in sorted(
+                valid_rem,
+                key=lambda o: (
+                    self._dist(current_pos, (o.sx, o.sy)),
+                    o.et,
+                    -o.p,
+                    o.id,
+                ),
+            ):
+                d_to_pickup = self._dist(current_pos, (best.sx, best.sy))
+                d_to_delivery = self._get_order_delivery_dist(best)
+                if d_to_pickup >= INF or d_to_delivery >= INF:
+                    remaining.remove(best)
+                    continue
+
+                t_estimated = current_t + d_to_pickup + d_to_delivery + 2
+                if self._strict_deadline_mode and t_estimated - best.et > self.max_delivery_delay:
+                    remaining.remove(best)
+                    continue
+                if delivery_reward(best, t_estimated, self.env.T) <= 0:
+                    remaining.remove(best)
+                    continue
+
+                test_route = route + [best]
+                delivery_times = self._estimate_route_times(
+                    shipper.position, test_route, [], current_t
+                )
+                if not delivery_times:
+                    remaining.remove(best)
+                    continue
+
+                if self._strict_deadline_mode:
+                    feasible = all(
+                        delivery_times.get(order.id, INF) - order.et <= self.max_delivery_delay
+                        for order in test_route
+                    )
+                    if not feasible:
+                        remaining.remove(best)
+                        continue
+
+                route = test_route
+                current_pos = (best.sx, best.sy)
+                total_weight += best.w
+                total_slots += 1
+                remaining.remove(best)
+                found_next = True
+                break
+
+            if not found_next:
+                break
+        
+        return route[0] if route else None
+
+    def _resolve_deadlocks(self, shippers: List[Shipper], actions: Dict[int, Action]) -> Dict[int, Action]:
+        resolved = dict(actions)
+        positions = {s.id: s.position for s in shippers}
+        shipper_by_id = {s.id: s for s in shippers}
+        
+        desired = {}
+        for s in shippers:
+            move, op = resolved.get(s.id, ("S", 0))
+            desired[s.id] = valid_next_pos(s.position, move, self.grid)
+
+        def priority_key(sid: int) -> Tuple[int, int]:
+            shipper = shipper_by_id[sid]
+            _, op = resolved.get(sid, ("S", 0))
+            if shipper.bag or op == 2:
+                return (0, sid)
+            if op == 1:
+                return (1, sid)
+            return (2, sid)
+
+        def safe_yield_move(sid: int, avoid: Set[Position]) -> Optional[Move]:
+            shipper = shipper_by_id[sid]
+            occupied_now = set(positions.values())
+            reserved_next = {pos for other, pos in desired.items() if other != sid}
+            candidates: List[Tuple[int, Move]] = []
+            for move in ("U", "D", "L", "R"):
+                nxt = valid_next_pos(shipper.position, move, self.grid)
+                if nxt == shipper.position:
+                    continue
+                if nxt in occupied_now or nxt in reserved_next:
+                    continue
+                candidates.append((1 if nxt in avoid else 0, move))
+            if not candidates:
+                return None
+            candidates.sort()
+            return candidates[0][1]
+
+        # A loaded shipper should not wait behind an idle shipper if the idle
+        # shipper can step aside locally.
+        for mover in sorted(shippers, key=lambda s: priority_key(s.id)):
+            mover_target = desired.get(mover.id, mover.position)
+            if mover_target == mover.position:
+                continue
+            for blocker in shippers:
+                if blocker.id == mover.id:
+                    continue
+                if positions[blocker.id] != mover_target:
+                    continue
+                blocker_action = resolved.get(blocker.id, ("S", 0))
+                blocker_idle = (
+                    not blocker.bag
+                    and blocker_action[0] == "S"
+                    and blocker_action[1] == 0
+                    and desired.get(blocker.id) == blocker.position
+                )
+                mover_has_work = bool(mover.bag) or resolved.get(mover.id, ("S", 0))[1] in {1, 2}
+                if not blocker_idle or not mover_has_work:
+                    continue
+                yield_move = safe_yield_move(blocker.id, {mover.position, mover_target})
+                if yield_move is not None:
+                    resolved[blocker.id] = (yield_move, 0)
+                    desired[blocker.id] = valid_next_pos(blocker.position, yield_move, self.grid)
+                break
+
+        # Resolve same-cell next-step conflicts cheaply. The lower priority
+        # shipper waits or sidesteps.
+        target_to_sids: Dict[Position, List[int]] = {}
+        for sid, pos in desired.items():
+            target_to_sids.setdefault(pos, []).append(sid)
+        for target, sids in target_to_sids.items():
+            if len(sids) <= 1:
+                continue
+            ordered = sorted(sids, key=priority_key)
+            for sid in ordered[1:]:
+                yield_move = safe_yield_move(sid, {target})
+                if yield_move is not None:
+                    resolved[sid] = (yield_move, 0)
+                    desired[sid] = valid_next_pos(positions[sid], yield_move, self.grid)
+                else:
+                    resolved[sid] = ("S", 0)
+                    desired[sid] = positions[sid]
+
+        for s1 in shippers:
+            for s2 in shippers:
+                if s1.id >= s2.id:
+                    continue
+                u, v = s1.id, s2.id
+                pos_u, pos_v = positions[u], positions[v]
+                des_u, des_v = desired[u], desired[v]
+                
+                if des_u == pos_v and des_v == pos_u and pos_u != pos_v:
+                    evader = v
+                    other = u
+                    evader_pos = pos_v
+                    other_pos = pos_u
+                    
+                    moved = False
+                    for m in ("U", "D", "L", "R"):
+                        nxt = valid_next_pos(evader_pos, m, self.grid)
+                        if nxt != evader_pos and nxt != other_pos and nxt not in positions.values():
+                            resolved[evader] = (m, 0)
+                            desired[evader] = nxt
+                            moved = True
+                            break
+                            
+                    if not moved:
+                        m_init = actions[evader][0]
+                        reverse_move = {"U": "D", "D": "U", "L": "R", "R": "L"}
+                        if m_init in reverse_move:
+                            rev = reverse_move[m_init]
+                            nxt = valid_next_pos(evader_pos, rev, self.grid)
+                            if nxt != evader_pos and nxt not in positions.values():
+                                resolved[evader] = (rev, 0)
+                                desired[evader] = nxt
+                                moved = True
+                                
+                    if not moved:
+                        resolved[evader] = ("S", 0)
+                        desired[evader] = evader_pos
+                        
+        return resolved
+
+    def _drop_stale_order_targets(self, sid: int, oid: int) -> None:
+        queue = self._targets.get(sid)
+        if not queue:
+            return
+        self._targets[sid] = deque(stop for stop in queue if stop[2] != oid)
+
+    def _is_stop_actionable(self, stop: Tuple[Position, int, int], shipper: Shipper, obs: dict) -> bool:
+        if not super()._is_stop_actionable(stop, shipper, obs):
+            return False
+        if not self._strict_deadline_mode:
+            return True
+
+        pos, op, oid = stop
+        if op != 1:
+            return True
+
+        order = obs["orders"].get(oid)
+        if order is None:
+            return False
+
+        d_pick = self._dist(shipper.position, pos)
+        d_drop = self._get_order_delivery_dist(order)
+        if d_pick >= INF or d_drop >= INF:
+            return False
+        eta = obs["t"] + d_pick + d_drop + 2
+        return eta - order.et <= self.max_delivery_delay
 
     def _get_shipper_goal(self, shipper: Shipper, obs: dict) -> Tuple[Position, int]:
         orders: Dict[int, Order] = obs["orders"]
@@ -36,61 +624,46 @@ class MAPDCBSSolver(ACOSolver):
 
         if queue:
             while queue and not self._is_stop_actionable(queue[0], shipper, obs):
-                queue.popleft()
+                removed_stop = queue.popleft()
+                if removed_stop[1] == 1:
+                    self._drop_stale_order_targets(shipper.id, removed_stop[2])
+                    queue = self._targets[shipper.id]
 
             if queue:
                 stop = queue[0]
                 goal, op, _ = stop
-
-                if op == 2:
-                    return goal, op
-
                 return goal, op
 
+        current_t = obs["t"]
         carried = [
             orders[oid]
             for oid in shipper.bag
             if oid in orders and not orders[oid].delivered
         ]
         if carried:
-            best = min(
-                carried,
-                key=lambda o: (self._dist(shipper.position, (o.ex, o.ey)), o.et, -o.p, o.id),
+            delivery_order = self._select_delivery_order(shipper, orders)
+            if delivery_order is None:
+                return shipper.position, 0
+            self._targets[shipper.id].append(
+                ((delivery_order.ex, delivery_order.ey), 2, delivery_order.id)
             )
-            return (best.ex, best.ey), 2
+            stop = self._targets[shipper.id][0]
+            return stop[0], stop[1]
 
-        # Greedy pick fallback
-        candidates = []
-        obs_t = obs["t"]
-        for order in orders.values():
-            if order.picked or order.delivered:
-                continue
-            if order.id in self._reserved:
-                continue
-            if not shipper.can_carry(order, orders):
-                continue
-            d_pick = self._dist(shipper.position, (order.sx, order.sy))
-            d_drop = self._dist((order.sx, order.sy), (order.ex, order.ey))
-            if d_pick >= INF or d_drop >= INF:
-                continue
-            if obs_t + d_pick + d_drop >= order.et + self.env.T:
-                continue
-            candidates.append(order)
+        # Shipper is empty
+        available_orders = {oid: o for oid, o in orders.items() if oid not in self._reserved}
+        pickup_order = self._plan_multi_pickup_route(shipper, available_orders, current_t)
+        if pickup_order is None:
+            pickup_order = self._select_pickup_v1(shipper, orders, self._reserved, current_t)
 
-        if not candidates:
-            return shipper.position, 0
+        if pickup_order is not None:
+            self._reserved.add(pickup_order.id)
+            self._targets[shipper.id].append(((pickup_order.sx, pickup_order.sy), 1, pickup_order.id))
+            self._targets[shipper.id].append(((pickup_order.ex, pickup_order.ey), 2, pickup_order.id))
+            stop = self._targets[shipper.id][0]
+            return stop[0], stop[1]
 
-        best = min(
-            candidates,
-            key=lambda o: (
-                self._dist(shipper.position, (o.sx, o.sy)),
-                -o.p,
-                o.et,
-                o.id,
-            ),
-        )
-        self._reserved.add(best.id)
-        return (best.sx, best.sy), 1
+        return shipper.position, 0
 
     def _space_time_astar(
         self,
@@ -103,12 +676,23 @@ class MAPDCBSSolver(ACOSolver):
         Space-Time A* searching for a collision-free path up to max_t.
         Returns a list of positions of length max_t + 1.
         """
+        if not constraints:
+            moves = self._path(start, goal)
+            path = [start]
+            curr = start
+            for mv in moves[:max_t]:
+                curr = valid_next_pos(curr, mv, self.grid)
+                path.append(curr)
+            while len(path) < max_t + 1:
+                path.append(path[-1])
+            return path
+
         # A* Node: (f, g, r, c, t)
         open_list = []
         heapq.heappush(open_list, (self._dist(start, goal), 0, start[0], start[1], 0))
         
-        # visited: (r, c, t) -> g
-        visited = {(start[0], start[1], 0): 0}
+        # visited: set of (r, c, t)
+        visited = {(start[0], start[1], 0)}
         
         # parent pointers
         parent = {}
@@ -135,19 +719,20 @@ class MAPDCBSSolver(ACOSolver):
                 
                 # Check constraints
                 # Vertex constraint: (nr, nc, t+1)
-                if (nr, nc, t + 1) in constraints:
+                nt = t + 1
+                if (nr, nc, nt) in constraints:
                     continue
                 # Edge constraint: (r, c, nr, nc, t) meaning moving from (r,c) to (nr,nc) at time t
                 if (r, c, nr, nc, t) in constraints:
                     continue
                     
-                nt = t + 1
-                if (nr, nc, nt) not in visited or visited[(nr, nc, nt)] > g + 1:
-                    visited[(nr, nc, nt)] = g + 1
-                    parent[(nr, nc, nt)] = (r, c, t)
+                state = (nr, nc, nt)
+                if state not in visited:
+                    visited.add(state)
+                    parent[state] = (r, c, t)
                     # heuristic
                     h = self._dist((nr, nc), goal)
-                    heapq.heappush(open_list, (g + 1 + h, g + 1, nr, nc, nt))
+                    heapq.heappush(open_list, (nt + h, nt, nr, nc, nt))
                     
         if best_node is None:
             return None
@@ -170,26 +755,23 @@ class MAPDCBSSolver(ACOSolver):
         """
         sids = list(paths.keys())
         for t in range(1, max_t + 1):
-            # Check vertex conflicts
             pos_to_sid = {}
+            edge_to_sid = {}
             for sid in sids:
                 if t < len(paths[sid]):
                     pos = paths[sid][t]
+                    # Check vertex conflicts
                     if pos in pos_to_sid:
                         return ('V', pos_to_sid[pos], sid, pos[0], pos[1], t)
                     pos_to_sid[pos] = sid
-            
-            # Check edge conflicts
-            for i in range(len(sids)):
-                for j in range(i + 1, len(sids)):
-                    sid1, sid2 = sids[i], sids[j]
-                    if t < len(paths[sid1]) and t < len(paths[sid2]):
-                        u1 = paths[sid1][t-1]
-                        v1 = paths[sid1][t]
-                        u2 = paths[sid2][t-1]
-                        v2 = paths[sid2][t]
-                        if u1 == v2 and v1 == u2 and u1 != v1:
-                            return ('E', sid1, sid2, u1[0], u1[1], v1[0], v1[1], t - 1)
+                    
+                    # Check edge conflicts
+                    u = paths[sid][t-1]
+                    v = pos
+                    if u != v:
+                        if (v, u) in edge_to_sid:
+                            return ('E', edge_to_sid[(v, u)], sid, v[0], v[1], u[0], u[1], t - 1)
+                        edge_to_sid[(u, v)] = sid
         return None
 
     def _cbs(self, start_positions: Dict[int, Position], goals: Dict[int, Position]) -> Optional[Dict[int, List[Position]]]:
@@ -240,22 +822,24 @@ class MAPDCBSSolver(ACOSolver):
                 _, sid1, sid2, r, c, t = conflict
                 
                 # Branch 1: sid1 cannot be at (r, c) at time t
-                constraints1 = {k: set(v) for k, v in constraints.items()}
+                constraints1 = constraints.copy()
+                constraints1[sid1] = constraints[sid1].copy()
                 constraints1[sid1].add((r, c, t))
                 path1 = self._space_time_astar(start_positions[sid1], goals[sid1], constraints1[sid1], self.window_size)
                 if path1:
-                    paths1 = {k: list(v) for k, v in paths.items()}
+                    paths1 = paths.copy()
                     paths1[sid1] = path1
                     cost1 = sum(len(p) for p in paths1.values())
                     heapq.heappush(open_list, (cost1, node_id_counter, constraints1, paths1))
                     node_id_counter += 1
                     
                 # Branch 2: sid2 cannot be at (r, c) at time t
-                constraints2 = {k: set(v) for k, v in constraints.items()}
+                constraints2 = constraints.copy()
+                constraints2[sid2] = constraints[sid2].copy()
                 constraints2[sid2].add((r, c, t))
                 path2 = self._space_time_astar(start_positions[sid2], goals[sid2], constraints2[sid2], self.window_size)
                 if path2:
-                    paths2 = {k: list(v) for k, v in paths.items()}
+                    paths2 = paths.copy()
                     paths2[sid2] = path2
                     cost2 = sum(len(p) for p in paths2.values())
                     heapq.heappush(open_list, (cost2, node_id_counter, constraints2, paths2))
@@ -265,28 +849,432 @@ class MAPDCBSSolver(ACOSolver):
                 _, sid1, sid2, r1, c1, r2, c2, t = conflict
                 
                 # Branch 1: sid1 cannot move from (r1, c1) to (r2, c2) at time t
-                constraints1 = {k: set(v) for k, v in constraints.items()}
+                constraints1 = constraints.copy()
+                constraints1[sid1] = constraints[sid1].copy()
                 constraints1[sid1].add((r1, c1, r2, c2, t))
                 path1 = self._space_time_astar(start_positions[sid1], goals[sid1], constraints1[sid1], self.window_size)
                 if path1:
-                    paths1 = {k: list(v) for k, v in paths.items()}
+                    paths1 = paths.copy()
                     paths1[sid1] = path1
                     cost1 = sum(len(p) for p in paths1.values())
                     heapq.heappush(open_list, (cost1, node_id_counter, constraints1, paths1))
                     node_id_counter += 1
                     
                 # Branch 2: sid2 cannot move from (r2, c2) to (r1, c1) at time t
-                constraints2 = {k: set(v) for k, v in constraints.items()}
+                constraints2 = constraints.copy()
+                constraints2[sid2] = constraints[sid2].copy()
                 constraints2[sid2].add((r2, c2, r1, c1, t))
                 path2 = self._space_time_astar(start_positions[sid2], goals[sid2], constraints2[sid2], self.window_size)
                 if path2:
-                    paths2 = {k: list(v) for k, v in paths.items()}
+                    paths2 = paths.copy()
                     paths2[sid2] = path2
                     cost2 = sum(len(p) for p in paths2.values())
                     heapq.heappush(open_list, (cost2, node_id_counter, constraints2, paths2))
                     node_id_counter += 1
 
-        return None # No solution found within limits
+    def _should_replan(self, obs: dict) -> bool:
+        t = obs["t"]
+        if t - self._last_plan_t >= self._replan_interval:
+            return True
+        if obs.get("new_order_ids"):
+            if self.env.G >= 1000 or self.env.C >= 20:
+                return len(obs["new_order_ids"]) >= 5 and t - self._last_plan_t >= 10
+            if self.env.N >= 50:
+                return t - self._last_plan_t >= 5
+            return True
+
+        has_unassigned = any(not o.picked and not o.delivered for o in obs["orders"].values())
+        if has_unassigned:
+            if self.env.G >= 1000 or self.env.C >= 20:
+                return False
+            if self.env.N >= 50 and t - self._last_plan_t < 10:
+                return False
+            for s in obs["shippers"]:
+                if not self._targets.get(s.id):
+                    return True
+
+        return False
+
+    def _active_orders(self, obs: dict) -> List[Order]:
+        if self._strict_deadline_mode:
+            orders: Dict[int, Order] = obs["orders"]
+            shippers: List[Shipper] = obs["shippers"]
+            obs_t = obs["t"]
+            candidates: List[Order] = []
+            metrics: Dict[int, Tuple[int, int, float]] = {}
+            for order in orders.values():
+                if order.picked or order.delivered:
+                    continue
+                best_eta = INF
+                best_score = 0.0
+                for shipper in shippers:
+                    if not shipper.can_carry(order, orders):
+                        continue
+                    d_pick = self._dist(shipper.position, (order.sx, order.sy))
+                    d_drop = self._get_order_delivery_dist(order)
+                    if d_pick >= INF or d_drop >= INF:
+                        continue
+                    eta = obs_t + d_pick + d_drop
+                    best_eta = min(best_eta, eta)
+                    reward = delivery_reward(order, eta, self.env.T)
+                    best_score = max(best_score, reward / max(d_pick + d_drop, 1))
+                if best_eta >= INF or best_score <= 0:
+                    continue
+                feasible_rank = 0 if best_eta - order.et <= self.max_delivery_delay else 1
+                metrics[order.id] = (feasible_rank, best_eta, best_score)
+                candidates.append(order)
+
+            candidates.sort(
+                key=lambda o: (
+                    metrics[o.id][0],
+                    -metrics[o.id][2],
+                    o.et,
+                    metrics[o.id][1],
+                    -o.p,
+                    o.id,
+                )
+            )
+        else:
+            candidates = super()._active_orders(obs)
+        max_active = self._max_active_override or max(50, self.env.C * 3)
+        return candidates[:max_active]
+
+    def _eta_pickup(
+        self,
+        pos: Position,
+        order: Order,
+        elapsed: int,
+        obs_t: int,
+        d_pick: int,
+    ) -> float:
+        if not self._strict_deadline_mode:
+            return super()._eta_pickup(pos, order, elapsed, obs_t, d_pick)
+
+        d_drop = self._get_order_delivery_dist(order)
+        if d_pick >= INF or d_drop >= INF:
+            return 0.0
+
+        eta_delivery = obs_t + elapsed + d_pick + d_drop
+        reward = delivery_reward(order, eta_delivery, self.env.T)
+        if reward <= 0:
+            return 0.0
+
+        lateness = eta_delivery - order.et
+        if lateness > self.max_delivery_delay:
+            return 0.0
+
+        slack = max(order.et - eta_delivery, 0)
+        urgency = 1.0 / max(order.et - obs_t, 1)
+        return reward / (d_pick + d_drop + 1) + 12.0 * urgency + 0.05 * order.p + 0.002 * slack
+
+    def _eta_delivery(
+        self,
+        order: Order,
+        elapsed: int,
+        obs_t: int,
+        d: int,
+    ) -> float:
+        if not self._strict_deadline_mode:
+            return super()._eta_delivery(order, elapsed, obs_t, d)
+
+        if d >= INF:
+            return 0.0
+        arrival = obs_t + elapsed + d
+        reward = delivery_reward(order, arrival, self.env.T)
+        if arrival <= order.et:
+            urgency = 2.0 + 1.0 / max(order.et - obs_t, 1)
+        else:
+            urgency = max(0.2, 1.0 - (arrival - order.et) / max(self.env.T, 1))
+        return max(0.001, reward * urgency / (d + 1))
+
+    def _replan(self, obs: dict) -> None:
+        self._stats["aco_calls"] += 1
+        return super()._replan(obs)
+
+    def _construct_solution(
+        self,
+        obs: dict,
+        active_orders: List[Order],
+        pheromone: Dict[EdgeKey, float],
+        exploit: bool,
+    ) -> Dict[int, List[RouteStop]]:
+        orders: Dict[int, Order] = obs["orders"]
+        shippers: List[Shipper] = obs["shippers"]
+        obs_t = obs["t"]
+
+        assigned: Set[int] = set()
+        routes: Dict[int, List[RouteStop]] = {s.id: [] for s in shippers}
+
+        state: Dict[int, dict] = {}
+        for s in shippers:
+            bag = [oid for oid in s.bag if oid in orders and not orders[oid].delivered]
+            state[s.id] = {
+                "pos": s.position,
+                "elapsed": 0,
+                "from_node": -(s.id + 1),
+                "bag": bag,
+                "carried_weight": sum(orders[oid].w for oid in bag if oid in orders),
+                "finished": False,
+                "K_max": s.K_max,
+                "W_max": s.W_max,
+            }
+
+        while True:
+            candidates: List[Tuple[int, RouteStop, Order, int, float, EdgeKey]] = []
+
+            for sid, s_state in state.items():
+                if s_state["finished"] or len(routes[sid]) >= self._route_limit():
+                    continue
+
+                pos = s_state["pos"]
+                elapsed = s_state["elapsed"]
+                from_node = s_state["from_node"]
+                bag = s_state["bag"]
+                carried_weight = s_state["carried_weight"]
+                K_max = s_state["K_max"]
+                W_max = s_state["W_max"]
+
+                for oid in list(bag):
+                    order = orders.get(oid)
+                    if order is None or order.delivered:
+                        continue
+                    stop: RouteStop = ((order.ex, order.ey), 2, order.id)
+                    d = self._dist(pos, stop[0])
+                    eta = self._eta_delivery(order, elapsed, obs_t, d)
+                    if eta > 0:
+                        candidates.append((sid, stop, order, d, eta, self._edge_key(from_node, stop)))
+
+                if len(bag) < K_max:
+                    # Filter active orders to only the closest ones
+                    if self.env.G >= 1000 or self.env.C >= 20:
+                        k_closest = min(len(active_orders), self._pickup_candidate_limit())
+                    else:
+                        k_closest = max(40, len(active_orders) // 2)
+                    if len(active_orders) > k_closest:
+                        shipper_active_orders = heapq.nsmallest(
+                            k_closest,
+                            active_orders,
+                            key=lambda o: abs(pos[0] - o.sx) + abs(pos[1] - o.sy)
+                        )
+                    else:
+                        shipper_active_orders = active_orders
+
+                    for order in shipper_active_orders:
+                        if order.id in assigned or order.id in bag:
+                            continue
+                        if order.picked or order.delivered:
+                            continue
+                        if carried_weight + order.w > W_max:
+                            continue
+                        stop = ((order.sx, order.sy), 1, order.id)
+                        d_pick = self._dist(pos, stop[0])
+                        eta = self._eta_pickup(pos, order, elapsed, obs_t, d_pick)
+                        if eta > 0:
+                            candidates.append((sid, stop, order, d_pick, eta, self._edge_key(from_node, stop)))
+
+            if not candidates:
+                break
+
+            selected_idx = self._select_parallel_candidate(candidates, pheromone, exploit)
+            sid, stop, order, travel, _, edge_key = candidates[selected_idx]
+
+            s_state = state[sid]
+            routes[sid].append(stop)
+            s_state["pos"] = stop[0]
+            s_state["elapsed"] += travel
+            s_state["from_node"] = self._node_id(stop)
+
+            if stop[1] == 1:
+                assigned.add(order.id)
+                s_state["bag"].append(order.id)
+                s_state["carried_weight"] += order.w
+            else:
+                if order.id in s_state["bag"]:
+                    s_state["bag"].remove(order.id)
+                s_state["carried_weight"] = max(0.0, s_state["carried_weight"] - order.w)
+
+            if s_state["elapsed"] >= self.env.T:
+                s_state["finished"] = True
+
+        return routes
+
+    def _action_from_goal(self, shipper: Shipper, goal: Position, op: int) -> Action:
+        return self._navigate_to(shipper.position, goal, op)
+
+    def _action_from_cbs_path(
+        self,
+        sid: int,
+        curr_pos: Position,
+        path: List[Position],
+        goal: Position,
+        op: int,
+    ) -> Action:
+        if len(path) > 1:
+            next_pos = path[1]
+            dr = next_pos[0] - curr_pos[0]
+            dc = next_pos[1] - curr_pos[1]
+            move = MOVE_TO_STR.get((dr, dc), "S")
+        else:
+            move = "S"
+
+        next_pos = valid_next_pos(curr_pos, move, self.grid)
+        if move != "S" and next_pos == goal:
+            return (move, op)
+        if move == "S" and curr_pos == goal:
+            return ("S", op)
+        return (move, 0)
+
+    def _independent_actions(
+        self,
+        shippers: List[Shipper],
+        goals: Dict[int, Position],
+        ops: Dict[int, int],
+    ) -> Dict[int, Action]:
+        actions: Dict[int, Action] = {}
+        for shipper in sorted(shippers, key=lambda s: s.id):
+            actions[shipper.id] = self._action_from_goal(
+                shipper,
+                goals[shipper.id],
+                ops[shipper.id],
+            )
+        return actions
+
+    def _predicted_conflict_pairs(
+        self,
+        shippers: List[Shipper],
+        actions: Dict[int, Action],
+    ) -> Set[Tuple[int, int]]:
+        positions = {s.id: s.position for s in shippers}
+        desired = {
+            s.id: valid_next_pos(s.position, actions.get(s.id, ("S", 0))[0], self.grid)
+            for s in shippers
+        }
+
+        pairs: Set[Tuple[int, int]] = set()
+        by_target: Dict[Position, List[int]] = {}
+        for sid, pos in desired.items():
+            by_target.setdefault(pos, []).append(sid)
+        for sids in by_target.values():
+            if len(sids) > 1:
+                for i in range(len(sids)):
+                    for j in range(i + 1, len(sids)):
+                        pairs.add(tuple(sorted((sids[i], sids[j]))))
+
+        for s1 in shippers:
+            for s2 in shippers:
+                if s1.id >= s2.id:
+                    continue
+                if desired[s1.id] == positions[s2.id] and desired[s2.id] == positions[s1.id]:
+                    pairs.add((s1.id, s2.id))
+                elif desired[s1.id] == positions[s2.id] and desired[s2.id] == positions[s2.id]:
+                    pairs.add((s1.id, s2.id))
+                elif desired[s2.id] == positions[s1.id] and desired[s1.id] == positions[s1.id]:
+                    pairs.add((s1.id, s2.id))
+        return pairs
+
+    def _conflict_groups(self, shippers: List[Shipper], actions: Dict[int, Action]) -> List[Set[int]]:
+        pairs = self._predicted_conflict_pairs(shippers, actions)
+        if not pairs:
+            return []
+
+        parent = {s.id: s.id for s in shippers}
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for a, b in pairs:
+            union(a, b)
+
+        groups: Dict[int, Set[int]] = {}
+        for a, b in pairs:
+            groups.setdefault(find(a), set()).update((a, b))
+        return list(groups.values())
+
+    def _is_serious_conflict_group(
+        self,
+        group: Set[int],
+        shipper_by_id: Dict[int, Shipper],
+        ops: Dict[int, int],
+    ) -> bool:
+        for sid in group:
+            shipper = shipper_by_id[sid]
+            if shipper.bag or ops.get(sid) in {1, 2}:
+                return True
+        return False
+
+    def _run_cbs_counted(
+        self,
+        start_positions: Dict[int, Position],
+        goals: Dict[int, Position],
+        group_call: bool = False,
+    ) -> Optional[Dict[int, List[Position]]]:
+        self._stats["cbs_calls"] += 1
+        if group_call:
+            self._stats["group_cbs_calls"] += 1
+        paths = self._cbs(start_positions, goals)
+        if paths is None:
+            self._stats["cbs_failed"] += 1
+        else:
+            self._stats["cbs_success"] += 1
+        return paths
+
+    def _adaptive_actions(
+        self,
+        obs: dict,
+        goals: Dict[int, Position],
+        ops: Dict[int, int],
+        start_positions: Dict[int, Position],
+    ) -> Dict[int, Action]:
+        shippers: List[Shipper] = obs["shippers"]
+        shipper_by_id = {s.id: s for s in shippers}
+
+        if self._cbs_mode == "full":
+            cbs_paths = self._run_cbs_counted(start_positions, goals)
+            if cbs_paths is not None:
+                return {
+                    sid: self._action_from_cbs_path(
+                        sid,
+                        start_positions[sid],
+                        cbs_paths[sid],
+                        goals[sid],
+                        ops[sid],
+                    )
+                    for sid in start_positions
+                }
+
+        actions = self._independent_actions(shippers, goals, ops)
+        if self._cbs_mode != "group":
+            return actions
+
+        self._stats["local_steps"] += 1
+        for group in self._conflict_groups(shippers, actions):
+            if len(group) > self._group_cbs_max_size:
+                continue
+            if (self.env.G >= 1000 or self.env.C >= 20) and not self._is_serious_conflict_group(group, shipper_by_id, ops):
+                continue
+
+            sub_starts = {sid: start_positions[sid] for sid in group}
+            sub_goals = {sid: goals[sid] for sid in group}
+            cbs_paths = self._run_cbs_counted(sub_starts, sub_goals, group_call=True)
+            if cbs_paths is None:
+                continue
+            for sid in group:
+                actions[sid] = self._action_from_cbs_path(
+                    sid,
+                    start_positions[sid],
+                    cbs_paths[sid],
+                    goals[sid],
+                    ops[sid],
+                )
+        return actions
 
     def run(self) -> dict:
         start_time = time.time()
@@ -295,9 +1283,6 @@ class MAPDCBSSolver(ACOSolver):
         self._targets = {s.id: deque() for s in obs["shippers"]}
         self._reserved = set()
         self._last_plan_t = -self._replan_interval
-
-        # Store the planned paths for execution
-        planned_paths: Dict[int, List[Position]] = {}
 
         while not obs.get("done", False):
             if self._should_replan(obs):
@@ -308,48 +1293,26 @@ class MAPDCBSSolver(ACOSolver):
             ops: Dict[int, int] = {}
             start_positions: Dict[int, Position] = {}
             
-            for shipper in sorted(obs["shippers"], key=lambda s: s.id):
+            # Prioritize empty shippers first to claim pickup tasks
+            shippers_sorted = sorted(obs["shippers"], key=lambda s: (len(s.bag) > 0, s.id))
+            for shipper in shippers_sorted:
                 goal, op = self._get_shipper_goal(shipper, obs)
                 goals[shipper.id] = goal
                 ops[shipper.id] = op
                 start_positions[shipper.id] = shipper.position
                 
-            # Use Windowed CBS to find collision-free next steps
-            cbs_paths = self._cbs(start_positions, goals)
-            
-            actions: Dict[int, Action] = {}
-            
-            if cbs_paths is not None:
-                # Execution from CBS plan
-                for sid in start_positions:
-                    if len(cbs_paths[sid]) > 1:
-                        next_pos = cbs_paths[sid][1]
-                        curr_pos = start_positions[sid]
-                        dr, dc = next_pos[0] - curr_pos[0], next_pos[1] - curr_pos[1]
-                        move_str = MOVE_TO_STR.get((dr, dc), "S")
-                    else:
-                        move_str = "S"
-                        
-                    # Check if goal reached to apply op
-                    if move_str != "S" and valid_next_pos(curr_pos, move_str, self.grid) == goals[sid]:
-                        actions[sid] = (move_str, ops[sid])
-                    elif move_str == "S" and curr_pos == goals[sid]:
-                        actions[sid] = ("S", ops[sid])
-                    else:
-                        actions[sid] = (move_str, 0)
-            else:
-                # Fallback: execute standard greedy paths independently
-                for shipper in sorted(obs["shippers"], key=lambda s: s.id):
-                    # We can use the ACO _navigate_to for fallback
-                    goal = goals[shipper.id]
-                    op = ops[shipper.id]
-                    actions[shipper.id] = self._navigate_to(shipper.position, goal, op)
+            actions = self._adaptive_actions(obs, goals, ops, start_positions)
 
+            actions = self._resolve_deadlocks(obs["shippers"], actions)
             obs, _, done, _ = self.env.step(actions)
             if done:
                 break
 
-        return self.env.result(
+        result = self.env.result(
             self.method_name,
             elapsed_sec=time.time() - start_time,
         )
+        result["mapd_cbs_stats"] = dict(self._stats)
+        result["cbs_mode"] = self._cbs_mode
+        result["replan_interval"] = self._replan_interval
+        return result
