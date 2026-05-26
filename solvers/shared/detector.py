@@ -53,7 +53,7 @@ class OnlineSurgeHotspotDetector:
         self.is_surge = recent_rate > (self.lambda0 * 2.2)
         
         # 4. Xác định Hotspots (Manhattan distance <= 3)
-        if self.is_surge and self.pickup_counts:
+        if self.pickup_counts:
             candidates = {}
             for (sx, sy), count in self.pickup_counts.items():
                 for dr in range(-3, 4):

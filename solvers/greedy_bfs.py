@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import time
 from collections import deque, OrderedDict
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -8,6 +9,229 @@ from env import DeliveryEnv, Order, Shipper, is_valid_cell, valid_next_pos, deli
 from solvers.solver import Solver
 from solvers.shared.detector import OnlineSurgeHotspotDetector
 
+# Hashing representation of grid to cache PathFinder instances
+_PATHFINDER_CACHE: Dict[Tuple[Tuple[int, ...], ...], PathFinder] = {}
+
+
+def get_pathfinder(grid: List[List[int]]) -> PathFinder:
+    grid_hash = tuple(tuple(row) for row in grid)
+    if grid_hash not in _PATHFINDER_CACHE:
+        _PATHFINDER_CACHE[grid_hash] = PathFinder(grid)
+    return _PATHFINDER_CACHE[grid_hash]
+
+
+class PathFinder:
+    """
+    Global Pathfinder that precomputes All-Pairs Shortest Path (APSP) and next-step routing
+    on GPU (or CPU) using PyTorch parallel BFS when available. Falls back to dynamic CPU-based
+    BFS when PyTorch is not available.
+    """
+
+    def __init__(self, grid: List[List[int]]):
+        self.grid = grid
+        self.N = len(grid)
+        
+        # Fallback CPU BFS caches (always initialized for safety/testing)
+        self._bfs_cache: Dict[Tuple[Tuple[int, int], Tuple[int, int]], Tuple[int, List[str]]] = {}
+        self._distance_cache: Dict[Tuple[Tuple[int, int], Tuple[int, int]], int] = {}
+        self._next_move_cache: Dict[Tuple[Tuple[int, int], Tuple[int, int]], str] = {}
+        
+        # Fast single source CPU BFS caches
+        self._adj: Dict[Tuple[int, int], List[Tuple[str, Tuple[int, int]]]] = {}
+        self._single_source_cache: Dict[Tuple[int, int], Tuple[Dict[Tuple[int, int], int], Dict[Tuple[int, int], Tuple[Tuple[int, int], str]]]] = {}
+        self._build_adjacency_list()
+        
+        self.has_torch = self._precompute_with_torch(grid)
+
+    def _build_adjacency_list(self):
+        for r in range(self.N):
+            for c in range(self.N):
+                pos = (r, c)
+                if is_valid_cell(pos, self.grid):
+                    neighbors = []
+                    for move in ("U", "D", "L", "R"):
+                        nxt = valid_next_pos(pos, move, self.grid)
+                        if nxt != pos:
+                            neighbors.append((move, nxt))
+                    self._adj[pos] = neighbors
+
+    def _compute_single_source(self, start: Tuple[int, int]):
+        if start in self._single_source_cache:
+            return
+        dist_map = {start: 0}
+        parent_map = {}  # nxt -> (curr, move)
+        if not is_valid_cell(start, self.grid):
+            self._single_source_cache[start] = (dist_map, parent_map)
+            return
+        queue = deque([start])
+        queue_append = queue.append
+        queue_popleft = queue.popleft
+        neighbors = self._adj
+        while queue:
+            curr = queue_popleft()
+            d_nxt = dist_map[curr] + 1
+            for move, nxt in neighbors.get(curr, []):
+                if nxt not in dist_map:
+                    dist_map[nxt] = d_nxt
+                    parent_map[nxt] = (curr, move)
+                    queue_append(nxt)
+        self._single_source_cache[start] = (dist_map, parent_map)
+
+    def _precompute_with_torch(self, grid: List[List[int]]) -> bool:
+        try:
+            import torch
+            
+            # Use GPU if available, else CPU
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            N = self.N
+            
+            # 1. Filter free cells and map them to 1D index
+            free_cells = [(r, c) for r in range(N) for c in range(N) if grid[r][c] == 0]
+            V = len(free_cells)
+            self.cell_to_idx = {cell: i for i, cell in enumerate(free_cells)}
+            self.idx_to_cell = free_cells
+            
+            # 2. Build adjacency tensor of shape (V+1, 4)
+            # Directions: 0: U, 1: D, 2: L, 3: R. Index V is used as dummy/padding
+            adj = torch.full((V + 1, 4), V, dtype=torch.long, device=device)
+            moves_offset = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+            for idx, (r, c) in enumerate(free_cells):
+                for dir_idx, (dr, dc) in enumerate(moves_offset):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < N and 0 <= nc < N and grid[nr][nc] == 0:
+                        adj[idx, dir_idx] = self.cell_to_idx[(nr, nc)]
+
+            # 3. Initialize distance, first-step, visited, and frontier matrices (all shape V+1 x V+1)
+            dist = torch.full((V + 1, V + 1), 9999, dtype=torch.int16, device=device)
+            first_move = torch.full((V + 1, V + 1), 4, dtype=torch.int8, device=device) # 4 is Stay ('S')
+
+            # Diagonal distance is 0 for all nodes (including dummy node V)
+            diag_indices = torch.arange(V + 1, device=device)
+            dist[diag_indices, diag_indices] = 0
+
+            # Visited and frontier initialization
+            visited = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
+            visited[diag_indices, diag_indices] = True
+
+            # Frontier initialization
+            frontier = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
+            for c in [3, 2, 1, 0]:  # Loop backwards to let smaller c (U < D < L < R) overwrite larger ones
+                neighbors = adj[:, c]
+                valid = neighbors < V
+                if valid.any():
+                    src_indices = torch.arange(V + 1, device=device)[valid]
+                    dest_indices = neighbors[valid]
+                    dist[src_indices, dest_indices] = 1
+                    first_move[src_indices, dest_indices] = c
+                    frontier[src_indices, dest_indices] = True
+                    visited[src_indices, dest_indices] = True
+
+            # 4. Multi-Source Parallel BFS loop
+            for d in range(2, min(V, N * 6)):
+                new_frontier = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
+                candidates = torch.full((4, V + 1, V + 1), 127, dtype=torch.int8, device=device)
+                reached_any = False
+                for c in range(4):
+                    reached = frontier[:, adj[:, c]] & ~visited
+                    if reached.any():
+                        candidates[c] = torch.where(reached, first_move[:, adj[:, c]], torch.tensor(127, dtype=torch.int8, device=device))
+                        reached_any = True
+                
+                if not reached_any:
+                    break
+                
+                min_candidate, _ = torch.min(candidates, dim=0)
+                reached_mask = min_candidate < 127
+                
+                dist = torch.where(reached_mask, torch.tensor(d, dtype=torch.int16, device=device), dist)
+                first_move = torch.where(reached_mask, min_candidate, first_move)
+                new_frontier = reached_mask
+                
+                visited |= new_frontier
+                frontier = new_frontier
+
+            # 5. Extract matrices to CPU numpy for fast lookups
+            self.dist_matrix = dist[:V, :V].cpu().numpy()
+            self.next_move_matrix = first_move[:V, :V].cpu().numpy()
+            self.adj_cpu = adj[:V].cpu().numpy()
+            return True
+        except Exception:
+            return False
+
+    def dist(self, start: Tuple[int, int], goal: Tuple[int, int]) -> int:
+        if self.has_torch:
+            if start == goal:
+                return 0
+            s_idx = self.cell_to_idx.get(start)
+            g_idx = self.cell_to_idx.get(goal)
+            if s_idx is None or g_idx is None:
+                return 10**9
+            d = self.dist_matrix[s_idx, g_idx]
+            return 10**9 if d >= 9999 else int(d)
+        else:
+            if start == goal:
+                return 0
+            if start not in self._single_source_cache:
+                self._compute_single_source(start)
+            return self._single_source_cache[start][0].get(goal, 10**9)
+
+    def path(self, start: Tuple[int, int], goal: Tuple[int, int]) -> List[str]:
+        if self.has_torch:
+            if start == goal:
+                return []
+            s_idx = self.cell_to_idx.get(start)
+            g_idx = self.cell_to_idx.get(goal)
+            if s_idx is None or g_idx is None:
+                return []
+
+            path_moves = []
+            curr_idx = s_idx
+            moves_list = ["U", "D", "L", "R"]
+            # Bounded path length to prevent infinite loops
+            for _ in range(self.N * 3):
+                if curr_idx == g_idx:
+                    break
+                move_idx = self.next_move_matrix[curr_idx, g_idx]
+                if move_idx == 4 or move_idx < 0 or move_idx >= 4:
+                    break
+                path_moves.append(moves_list[move_idx])
+                next_idx = self.adj_cpu[curr_idx, move_idx]
+                if next_idx >= len(self.idx_to_cell):
+                    break
+                curr_idx = next_idx
+            return path_moves
+        else:
+            if start == goal:
+                return []
+            if start not in self._single_source_cache:
+                self._compute_single_source(start)
+            dist_map, parent_map = self._single_source_cache[start]
+            if goal not in dist_map:
+                return []
+            moves = []
+            curr = goal
+            while curr != start:
+                curr, move = parent_map[curr]
+                moves.append(move)
+            moves.reverse()
+            return moves
+
+    def next_move(self, start: Tuple[int, int], goal: Tuple[int, int]) -> str:
+        if self.has_torch:
+            if start == goal:
+                return "S"
+            s_idx = self.cell_to_idx.get(start)
+            g_idx = self.cell_to_idx.get(goal)
+            if s_idx is None or g_idx is None:
+                return "S"
+            move_idx = self.next_move_matrix[s_idx, g_idx]
+            if 0 <= move_idx < 4:
+                return ["U", "D", "L", "R"][move_idx]
+            return "S"
+        else:
+            p = self.path(start, goal)
+            return p[0] if p else "S"
 
 Move = str
 Position = Tuple[int, int]
@@ -34,23 +258,69 @@ class GreedyBFS(Solver):
 
     def __init__(self, env: DeliveryEnv):
         super().__init__(env)
-        # Thiết lập max_delivery_delay động theo kích thước bản đồ
-        if self.env.N <= 22:
-            self.max_delivery_delay = 10
-        elif self.env.N <= 25:
-            self.max_delivery_delay = 5
-        elif self.env.N <= 30:
-            self.max_delivery_delay = -5
-        elif self.env.N <= 35:
-            self.max_delivery_delay = -8
-        else:
-            self.max_delivery_delay = -10
-        # Tiền tính toán adjacency list
-        self._adj: Dict[Position, List[Tuple[Move, Position]]] = {}
-        self._build_adjacency_list()
+        # Sử dụng PathFinder dùng chung có tối ưu hóa GPU/CPU
+        self.pathfinder = get_pathfinder(self.grid)
+        self._adj = self.pathfinder._adj
+
+        # Lấy mẫu avg_dist bằng BFS
+        valid_nodes = list(self._adj.keys())
+        sample_size = min(len(valid_nodes), 50)
+        rng = random.Random(42)
+        sample_nodes = rng.sample(valid_nodes, sample_size)
+        
+        total_dist = 0
+        pair_count = 0
+        for start in sample_nodes:
+            dist_map = {start: 0}
+            queue = deque([start])
+            queue_append = queue.append
+            queue_popleft = queue.popleft
+            while queue:
+                curr = queue_popleft()
+                d_nxt = dist_map[curr] + 1
+                for _, nxt in self._adj.get(curr, []):
+                    if nxt not in dist_map:
+                        dist_map[nxt] = d_nxt
+                        queue_append(nxt)
+            for d in dist_map.values():
+                if d > 0:
+                    total_dist += d
+                    pair_count += 1
+        avg_dist = total_dist / pair_count if pair_count > 0 else 10.0
+
+        self.avg_dist = avg_dist
+
+        # Thiết lập max_delivery_delay động dựa trên avg_dist và bottleneck_ratio
+        # Tính toán bottleneck_ratio trước
+        total_free_cells = len(self._adj)
+        bottleneck_cells = sum(1 for pos in self._adj.keys() if self._is_bottleneck(pos))
+        self.bottleneck_ratio = bottleneck_cells / total_free_cells if total_free_cells > 0 else 0.0
+
+        def interpolate(x, x_pts, y_pts):
+            if x <= x_pts[0]:
+                return y_pts[0]
+            if x >= x_pts[-1]:
+                return y_pts[-1]
+            for i in range(len(x_pts) - 1):
+                if x_pts[i] <= x <= x_pts[i+1]:
+                    t = (x - x_pts[i]) / (x_pts[i+1] - x_pts[i])
+                    return y_pts[i] + t * (y_pts[i+1] - y_pts[i])
+            return y_pts[-1]
+
+        x_pts = [13.66, 17.24, 17.75, 26.70, 29.95, 36.86]
+        y_delay = [15, 15, 2, -5, 2, -10]
+        y_opp = [15, 25, 10, 30, 20, 15]
+
+        self.max_delivery_delay = int(round(interpolate(avg_dist, x_pts, y_delay)))
+        self.max_opp_dist = int(round(interpolate(avg_dist, x_pts, y_opp)))
+
+        self.dist_matrix = None
+
+        # BFS cache size động
+        self.max_bfs_cache_size = min(self.env.N * self.env.N, 5000)
         
         # Single-source BFS cache: start -> (dist_map, next_move_map or None)
-        self._bfs_cache: Dict[Position, Tuple[Dict[Position, int], Optional[Dict[Position, Move]]]] = {}
+        self._bfs_cache: OrderedDict[Position, Tuple[Dict[Position, int], Optional[Dict[Position, Move]]]] = OrderedDict()
         
         # Cache khoảng cách từ (sx, sy) đến (ex, ey) của từng đơn hàng: order_id -> khoảng cách
         self._order_delivery_dist: Dict[int, int] = {}
@@ -63,6 +333,7 @@ class GreedyBFS(Solver):
             grid=self.grid
         )
         self._seen_order_ids: Set[int] = set()
+        self.enable_reposition = (self.bottleneck_ratio < 0.3)
 
     def _get_order_delivery_dist(self, order: Order) -> int:
         """Trả về khoảng cách từ pickup đến delivery của đơn hàng O(1) từ cache hoặc BFS."""
@@ -72,27 +343,15 @@ class GreedyBFS(Solver):
         self._order_delivery_dist[order.id] = dist
         return dist
 
-    def _build_adjacency_list(self):
-        """Xây dựng danh sách kề cho tất cả các ô trống hợp lệ trên bản đồ."""
-        N = len(self.grid)
-        for r in range(N):
-            for c in range(N):
-                pos = (r, c)
-                if is_valid_cell(pos, self.grid):
-                    neighbors = []
-                    for move in MOVES:
-                        nxt = valid_next_pos(pos, move, self.grid)
-                        if nxt != pos:
-                            neighbors.append((move, nxt))
-                    self._adj[pos] = neighbors
-
     def _neighbors(self, pos: Position) -> List[Tuple[Move, Position]]:
         """Trả về danh sách láng giềng kề hợp lệ O(1) từ cache."""
         return self._adj.get(pos, [])
 
     def _save_bfs_cache(self, key: Position, val: Tuple[Dict[Position, int], Optional[Dict[Position, Move]]]):
-        if len(self._bfs_cache) > 4000:
-            self._bfs_cache.clear()
+        if key in self._bfs_cache:
+            self._bfs_cache.pop(key)
+        elif len(self._bfs_cache) >= self.max_bfs_cache_size:
+            self._bfs_cache.popitem(last=False)
         self._bfs_cache[key] = val
 
     def _bfs_from(self, start: Position) -> Tuple[Dict[Position, int], Dict[Position, Move]]:
@@ -166,34 +425,18 @@ class GreedyBFS(Solver):
 
     def _distance(self, start: Position, goal: Position) -> int:
         """Khoảng cách đường đi ngắn nhất giữa start và goal."""
-        if start == goal:
-            return 0
-        if start in self._bfs_cache:
-            return self._bfs_cache[start][0].get(goal, INF)
-        if goal in self._bfs_cache:
-            return self._bfs_cache[goal][0].get(start, INF)
-            
-        dist_map = self._dist_bfs_from(start)
-        return dist_map.get(goal, INF)
+        return self.pathfinder.dist(start, goal)
 
     def _quick_distance(self, start: Position, goal: Position) -> int:
         """Khoảng cách nhanh sử dụng cache BFS, nếu chưa tính thì ước lượng bằng Manhattan."""
-        if start == goal:
-            return 0
-        if start in self._bfs_cache:
-            return self._bfs_cache[start][0].get(goal, INF)
-        if goal in self._bfs_cache:
-            return self._bfs_cache[goal][0].get(start, INF)
+        d = self.pathfinder.dist(start, goal)
+        if d < INF:
+            return d
         return abs(start[0] - goal[0]) + abs(start[1] - goal[1])
 
     def _next_move(self, start: Position, goal: Position) -> Move:
         """Bước đi tiếp theo đầu tiên từ start đi đến goal."""
-        if start == goal:
-            return "S"
-        if start in self._bfs_cache and self._bfs_cache[start][1] is not None:
-            return self._bfs_cache[start][1].get(goal, "S")
-        _, next_move_map = self._bfs_from(start)
-        return next_move_map.get(goal, "S")
+        return self.pathfinder.next_move(start, goal)
 
     # ------------------------------------------------------------------
     # Policy: chọn đơn trong bag để giao
@@ -368,7 +611,13 @@ class GreedyBFS(Solver):
                     else:
                         t += 1
             else:
-                t += dist + 1
+                if dist > 0:
+                    t += dist + 1
+                else:
+                    if last_was_delivery and last_delivery_pos == (best_d.ex, best_d.ey):
+                        pass
+                    else:
+                        t += 1
                 
             delivery_times[best_d.id] = t
             curr = (best_d.ex, best_d.ey)
@@ -471,7 +720,7 @@ class GreedyBFS(Solver):
 
             # Chỉ nhặt đơn cơ hội nếu khoảng cách hợp lý
             d_to_pickup = dist_map.get((order.sx, order.sy), INF)
-            max_opp_dist = 15 if self.env.N > 30 else 30
+            max_opp_dist = self.max_opp_dist
             if d_to_pickup > max_opp_dist:
                 continue
 
@@ -593,12 +842,10 @@ class GreedyBFS(Solver):
     def _is_bottleneck(self, pos: Position) -> bool:
         """Kiểm tra ô pos có phải nút cổ chai (<= 2 ô trống xung quanh) hay không."""
         r, c = pos
-        free_neighbors = 0
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < len(self.grid) and 0 <= nc < len(self.grid[0]) and self.grid[nr][nc] == 0:
-                free_neighbors += 1
-        return free_neighbors <= 2
+        return sum(
+            1 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            if 0 <= r + dr < len(self.grid) and 0 <= c + dc < len(self.grid[0]) and self.grid[r + dr][c + dc] == 0
+        ) <= 2
 
     def _bfs_path_avoiding(self, start: Position, goal: Position, other_positions: Set[Position]) -> Optional[List[Move]]:
         if start == goal:
@@ -654,8 +901,8 @@ class GreedyBFS(Solver):
 
         move = self._next_move(start, goal)
         
-        # Chỉ tránh nút cổ chai trên bản đồ lớn (N >= 100)
-        if len(self.grid) >= 100:
+        # Chỉ tránh nút cổ chai nếu tỉ lệ nút cổ chai trên bản đồ lớn (bottleneck_ratio > 0.15) hoặc bản đồ lớn (N >= 100)
+        if len(self.grid) >= 100 or self.bottleneck_ratio > 0.15:
             blocking_obstacles = set()
             shipper_goals = getattr(self, "_shipper_goals", {})
             all_shippers = getattr(self, "_all_shippers", [])
@@ -819,8 +1066,7 @@ class GreedyBFS(Solver):
             
             if not candidates_for_shippers:
                 # Các shipper còn lại không tìm được đơn hàng nào phù hợp
-                # Phân công hotspot theo kiểu Round-robin
-                hotspots = self.detector.predicted_hotspots if (hasattr(self, "detector") and self.detector.is_surge and self.detector.predicted_hotspots) else []
+                hotspots = self.detector.predicted_hotspots if (self.enable_reposition and hasattr(self, "detector") and self.detector.is_surge and self.detector.predicted_hotspots) else []
                 sorted_unmatched = sorted(unmatched_shippers, key=lambda s: s.id)
                 
                 for idx, shipper in enumerate(sorted_unmatched):
@@ -870,13 +1116,9 @@ class GreedyBFS(Solver):
             delivery_order = self._select_delivery(shipper, orders)
 
             if delivery_order is not None:
-                # Không làm opportunistic pickup cho C4 để ổn định điểm số
-                is_c4 = (self.env.N == 15 and self.env.C == 4)
-                opp = None
-                if not is_c4:
-                    opp = self._find_opportunistic_pickup(
-                        shipper, orders, reserved_pickups, current_t
-                    )
+                opp = self._find_opportunistic_pickup(
+                    shipper, orders, reserved_pickups, current_t
+                )
                 
                 if opp is not None:
                     reserved_pickups.add(opp.id)
