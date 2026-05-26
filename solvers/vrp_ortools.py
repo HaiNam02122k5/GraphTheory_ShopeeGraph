@@ -50,6 +50,7 @@ LATE_COST_SCALE       = 25   # Soft deadline penalty trên mỗi timestep trễ
 
 
 from solvers.shared.pathfinder import get_pathfinder
+from solvers.shared.detector import OnlineSurgeHotspotDetector
 
 try:
     from scipy.optimize import linear_sum_assignment as scipy_linear_sum_assignment
@@ -188,6 +189,25 @@ class VRPOrToolsSolver(Solver):
                         if nxt != pos:
                             neighbors.append((move, nxt))
                     adj[pos] = neighbors
+        self._adj = adj
+
+        # Thống kê bottleneck ratio để tránh tắc nghẽn
+        def local_is_bottleneck(pos):
+            r, c = pos
+            return sum(
+                1 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                if 0 <= r + dr < len(self.grid) and 0 <= c + dc < len(self.grid[0]) and self.grid[r + dr][c + dc] == 0
+            ) <= 2
+        free_cells = list(adj.keys())
+        bn_count = sum(1 for pos in free_cells if local_is_bottleneck(pos))
+        self.bottleneck_ratio = bn_count / len(free_cells) if free_cells else 0.0
+
+        # Khởi tạo detector
+        self.detector = OnlineSurgeHotspotDetector(
+            env.N, len(env.shippers), env.G, env.T, self.grid
+        )
+        self._seen_order_ids = set()
+
         valid_nodes = list(adj.keys())
         sample_size = min(len(valid_nodes), 50)
         import random
@@ -247,6 +267,216 @@ class VRPOrToolsSolver(Solver):
 
     def _path(self, a: Position, b: Position) -> List[Move]:
         return self.pathfinder.path(a, b)
+
+    def _is_bottleneck(self, pos: Position) -> bool:
+        """Kiểm tra ô pos có phải nút cổ chai (<= 2 ô trống xung quanh) hay không."""
+        r, c = pos
+        return sum(
+            1 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            if 0 <= r + dr < len(self.grid) and 0 <= c + dc < len(self.grid[0]) and self.grid[r + dr][c + dc] == 0
+        ) <= 2
+
+    def _bfs_path_avoiding(self, start: Position, goal: Position, other_positions: Set[Position]) -> Optional[List[Move]]:
+        if start == goal:
+            return []
+            
+        queue = deque([start])
+        visited = {start}
+        parent = {}
+        neighbors = self._adj
+        
+        found = False
+        while queue:
+            curr = queue.popleft()
+            if curr == goal:
+                found = True
+                break
+                
+            curr_neighbors = neighbors.get(curr, [])
+            for move, nxt in curr_neighbors:
+                if nxt in visited:
+                    continue
+                
+                # Tránh các ô có shipper khác đang ở trong nút cổ chai
+                if nxt != goal and nxt in other_positions and self._is_bottleneck(nxt):
+                    continue
+                    
+                visited.add(nxt)
+                parent[nxt] = (curr, move)
+                queue.append(nxt)
+                
+        if not found:
+            return None
+
+        # Reconstruct path
+        path = []
+        curr = goal
+        while curr != start:
+            curr, move = parent[curr]
+            path.append(move)
+        path.reverse()
+        return path
+
+    def _move_towards(self, shipper: Shipper, goal: Position) -> Tuple[Move, Position]:
+        """
+        Lấy bước đi kế tiếp và vị trí dự kiến sau bước đó.
+        """
+        start = shipper.position
+        if start == goal:
+            return "S", start
+
+        move = self.pathfinder.next_move(start, goal)
+        
+        # Chỉ tránh nút cổ chai nếu tỉ lệ nút cổ chai trên bản đồ lớn (bottleneck_ratio > 0.15) hoặc bản đồ lớn (N >= 100)
+        if len(self.grid) >= 100 or self.bottleneck_ratio > 0.15:
+            blocking_obstacles = set()
+            shipper_goals = getattr(self, "_shipper_goals", {})
+            all_shippers = getattr(self, "_all_shippers", [])
+            
+            for s in all_shippers:
+                if s.id == shipper.id:
+                    continue
+                pos_B = s.position
+                if self._is_bottleneck(pos_B):
+                    # Ước lượng điểm đến của B
+                    goal_B = shipper_goals.get(s.id, pos_B)
+                    move_B = self.pathfinder.next_move(pos_B, goal_B)
+                    nxt_B = valid_next_pos(pos_B, move_B, self.grid)
+                    
+                    # Kiểm tra xem B có đang đi về phía A (ngược chiều) hoặc đứng yên hay không
+                    dist_pos_B = abs(pos_B[0] - start[0]) + abs(pos_B[1] - start[1])
+                    dist_nxt_B = abs(nxt_B[0] - start[0]) + abs(nxt_B[1] - start[1])
+                    
+                    # B không đi xa A ra (tức là đi ngược chiều hoặc đứng yên)
+                    if dist_nxt_B <= dist_pos_B:
+                        # Nếu là hàng xóm trực tiếp (khoảng cách = 1) và đối đầu trực diện:
+                        # Giải quyết bằng độ ưu tiên ID (ID nhỏ được đi, ID lớn nhường)
+                        if dist_pos_B == 1:
+                            if shipper.id > s.id:
+                                blocking_obstacles.add(pos_B)
+                        else:
+                            blocking_obstacles.add(pos_B)
+                            
+            if blocking_obstacles:
+                # Kiểm tra xem đường đi chuẩn 15 bước tới có đi qua ô bị chặn nào không
+                path_blocked = False
+                curr = start
+                path_set = {curr}
+                for _ in range(15):
+                    move_step = self.pathfinder.next_move(curr, goal)
+                    if move_step == "S":
+                        break
+                    nxt = valid_next_pos(curr, move_step, self.grid)
+                    if nxt == curr or nxt in path_set:
+                        break
+                    path_set.add(nxt)
+                    if nxt in blocking_obstacles:
+                        path_blocked = True
+                        break
+                    curr = nxt
+ 
+                if path_blocked:
+                    alt_path = self._bfs_path_avoiding(start, goal, blocking_obstacles)
+                    if alt_path:
+                        move = alt_path[0]
+                    else:
+                        move = "S"  # Đứng yên ngoài nút cổ chai chờ thông đường
+ 
+        next_position = valid_next_pos(start, move, self.grid)
+        return move, next_position
+
+    def _resolve_deadlocks(self, shippers: List[Shipper], actions: Dict[int, Action], goals: Dict[int, Position]) -> Dict[int, Action]:
+        """
+        Phát hiện và giải quyết các trường hợp 2 shipper đối đầu trực tiếp (head-on collision)
+        tại các nút cổ chai hoặc hành lang hẹp bằng cách nhường đường.
+        """
+        resolved = dict(actions)
+        positions = {s.id: s.position for s in shippers}
+        
+        # Dự đoán ô mong muốn tiếp theo
+        desired = {}
+        for s in shippers:
+            move, op = resolved.get(s.id, ("S", 0))
+            desired[s.id] = valid_next_pos(s.position, move, self.grid)
+ 
+        for s1 in shippers:
+            for s2 in shippers:
+                if s1.id >= s2.id:
+                    continue
+                u, v = s1.id, s2.id
+                pos_u, pos_v = positions[u], positions[v]
+                des_u, des_v = desired[u], desired[v]
+                
+                # u muốn đi vào vị trí v, và v muốn đi vào vị trí u
+                if des_u == pos_v and des_v == pos_u and pos_u != pos_v:
+                    # Cho shipper có ID lớn hơn (v) tránh đường
+                    evader = v
+                    other = u
+                    evader_pos = pos_v
+                    other_pos = pos_u
+                    
+                    moved = False
+                    # Thử đi sang các ô trống bên cạnh
+                    for m in ("U", "D", "L", "R"):
+                        nxt = valid_next_pos(evader_pos, m, self.grid)
+                        if nxt != evader_pos and nxt != other_pos and nxt not in positions.values():
+                            resolved[evader] = (m, 0)
+                            desired[evader] = nxt
+                            moved = True
+                            break
+                            
+                    if not moved:
+                        # Nếu không tránh sang bên được, đi lùi
+                        m_init = actions[evader][0]
+                        reverse_move = {"U": "D", "D": "U", "L": "R", "R": "L"}
+                        if m_init in reverse_move:
+                            rev = reverse_move[m_init]
+                            nxt = valid_next_pos(evader_pos, rev, self.grid)
+                            if nxt != evader_pos and nxt not in positions.values():
+                                resolved[evader] = (rev, 0)
+                                desired[evader] = nxt
+                                moved = True
+                                
+                    if not moved:
+                        # Đứng yên nhường
+                        resolved[evader] = ("S", 0)
+                        desired[evader] = evader_pos
+                        
+        return resolved
+
+    def _evaluate_route_utility(self, s: Shipper, route: List[RouteStop], obs: dict) -> float:
+        if not route:
+            return 0.0
+            
+        orders = obs["orders"]
+        obs_t = obs["t"]
+        
+        utility = 0.0
+        curr_pos = s.position
+        elapsed = 0
+        
+        delivered_rewards = {}
+        lateness_penalties = 0.0
+        
+        for stop_pos, op, oid in route:
+            d = self._dist(curr_pos, stop_pos)
+            elapsed += d
+            curr_pos = stop_pos
+            
+            if op == 2:  # Delivery
+                o = orders[oid]
+                eta = obs_t + elapsed
+                reward = delivery_reward(o, eta, self.env.T)
+                delivered_rewards[oid] = reward
+                
+                if eta > o.et:
+                    lateness_penalties += (eta - o.et) * 2.5
+        
+        total_reward = sum(delivered_rewards.values())
+        move_cost = elapsed * 1.5
+        
+        utility = total_reward * 40.0 - lateness_penalties - move_cost
+        return utility
 
     # -----------------------------------------------------------------------
     # Expected reward helper
@@ -618,193 +848,96 @@ class VRPOrToolsSolver(Solver):
 
         assigned_map: Dict[int, List[Order]] = {s.id: [] for s in shippers}
 
-        mip_success = False
-        if unpicked and HAS_CVXPY and HAS_NUMPY:
-            try:
-                import cvxpy as cp
-                if cp.HIGHS in cp.installed_solvers():
-                    max_rounds = max(s.K_max for s in shippers)
-                    for round_idx in range(max_rounds):
-                        already_assigned_ids = {o.id for orders_list in assigned_map.values() for o in orders_list}
-                        unassigned_active = [o for o in unpicked if o.id not in already_assigned_ids]
-                        if not unassigned_active:
-                            break
+        max_rounds = max(s.K_max for s in shippers)
+        for round_idx in range(max_rounds):
+            already_assigned_ids = {o.id for orders_list in assigned_map.values() for o in orders_list}
+            unassigned_active = [o for o in unpicked if o.id not in already_assigned_ids]
+            if not unassigned_active:
+                break
 
-                        round_shippers = []
-                        ref_positions = {}
-                        estimated_elapsed = {}
+            round_shippers = []
+            for s in shippers:
+                current_count = len(s.bag) + len(assigned_map[s.id])
+                if current_count < s.K_max:
+                    round_shippers.append(s)
 
-                        for s in shippers:
-                            current_count = len(s.bag) + len(assigned_map[s.id])
-                            if current_count < s.K_max:
-                                round_shippers.append(s)
-                                route = self._build_route_for_shipper(s, assigned_map[s.id], obs, limit=8)
-                                if route:
-                                    ref_positions[s.id] = route[-1][0]
-                                    elapsed = 0
-                                    curr = s.position
-                                    for stop_pos, _, _ in route:
-                                        elapsed += self._dist(curr, stop_pos)
-                                        curr = stop_pos
-                                    estimated_elapsed[s.id] = elapsed
-                                else:
-                                    ref_positions[s.id] = s.position
-                                    estimated_elapsed[s.id] = 0
+            if not round_shippers:
+                break
 
-                        if not round_shippers:
-                            break
+            n_shippers = len(round_shippers)
+            n_orders = len(unassigned_active)
 
-                        n_shippers = len(round_shippers)
-                        n_orders = len(unassigned_active)
-
-                        R_mat = np.zeros((n_shippers, n_orders))
-                        infeasible_pairs = []
-
-                        for i, s in enumerate(round_shippers):
-                            ref_pos = ref_positions[s.id]
-                            elapsed = estimated_elapsed[s.id]
-                            for j, o in enumerate(unassigned_active):
-                                d_pick = self._dist(ref_pos, (o.sx, o.sy))
-                                d_drop = self._dist((o.sx, o.sy), (o.ex, o.ey))
-                                eta = obs_t + elapsed + d_pick + d_drop
-                                
-                                if (d_pick >= INF or d_drop >= INF or 
-                                    eta - o.et > max(self.max_delivery_delay, int(self.env.N * 1.5))):
-                                    infeasible_pairs.append((i, j))
-                                    R_mat[i, j] = -1e6
-                                else:
-                                    reward = delivery_reward(o, eta, self.env.T)
-                                    if reward < MIN_EXPECTED_REWARD:
-                                        infeasible_pairs.append((i, j))
-                                        R_mat[i, j] = -1e6
-                                    else:
-                                        lateness = max(0, eta - o.et)
-                                        score = reward * 40.0 + o.p * 8.0 - (d_pick + d_drop) * 1.0 - lateness * 2.5
-                                        R_mat[i, j] = score
-
-                        x = cp.Variable((n_shippers, n_orders), boolean=True)
-                        constraints = []
+            # Build cost matrix
+            C = []
+            for s in round_shippers:
+                current_weight = sum(orders[oid].w for oid in s.bag if oid in orders) + sum(ao.w for ao in assigned_map[s.id])
+                
+                # Baseline utility
+                route_base = self._build_route_for_shipper(s, assigned_map[s.id], obs)
+                baseline_util = self._evaluate_route_utility(s, route_base, obs)
+                
+                row_cost = []
+                for o in unassigned_active:
+                    if current_weight + o.w > s.W_max:
+                        row_cost.append(1e9)
+                        continue
                         
-                        if n_orders > 0:
-                            constraints.append(cp.sum(x, axis=0) <= 1)
-                        if n_shippers > 0:
-                            constraints.append(cp.sum(x, axis=1) <= 1)
-                            
-                        for i, j in infeasible_pairs:
-                            constraints.append(x[i, j] == 0)
-
-                        objective = cp.Maximize(cp.sum(cp.multiply(R_mat, x)))
-                        prob = cp.Problem(objective, constraints)
+                    # Build route with o
+                    route_new = self._build_route_for_shipper(s, assigned_map[s.id] + [o], obs)
+                    if not route_new:
+                        row_cost.append(1e9)
+                        continue
                         
-                        prob.solve(solver=cp.HIGHS, time_limit=1.5)
-                        
-                        if prob.status == cp.OPTIMAL:
-                            x_val = x.value
-                            matches = []
-                            for i, s in enumerate(round_shippers):
-                                for j, o in enumerate(unassigned_active):
-                                    if x_val[i, j] > 0.5:
-                                        matches.append((R_mat[i, j], i, j))
-                            matches.sort(key=lambda item: -item[0])
-                            
-                            any_assigned = False
-                            for score, i, j in matches:
-                                if score < -1e5:
-                                    continue
-                                s = round_shippers[i]
-                                o = unassigned_active[j]
-                                current_weight = sum(orders[oid].w for oid in s.bag if oid in orders) + sum(ao.w for ao in assigned_map[s.id])
-                                if current_weight + o.w <= s.W_max:
-                                    assigned_map[s.id].append(o)
-                                    any_assigned = True
-                            if not any_assigned:
+                    # Check feasibility (no late delivery beyond max_delivery_delay)
+                    feasible = True
+                    elapsed = 0
+                    curr = s.position
+                    for stop_pos, op, oid in route_new:
+                        d = self._dist(curr, stop_pos)
+                        elapsed += d
+                        curr = stop_pos
+                        if op == 2:  # Delivery
+                            eta = obs_t + elapsed
+                            if eta - orders[oid].et > self.max_delivery_delay:
+                                feasible = False
                                 break
-                        else:
-                            raise Exception("MIP round solve not optimal")
-                    mip_success = True
-            except Exception as e:
-                print(f"[MIP Debug] Exception: {e}")
-                pass
-
-        if not mip_success and unpicked:
-            # Fallback 1: scipy.optimize.linear_sum_assignment (Hungarian)
-            # Fallback 2: python_linear_sum_assignment (Hungarian thuần Python)
-            max_rounds = max(s.K_max for s in shippers)
-            for round_idx in range(max_rounds):
-                already_assigned_ids = {o.id for orders_list in assigned_map.values() for o in orders_list}
-                unassigned_active = [o for o in unpicked if o.id not in already_assigned_ids]
-                if not unassigned_active:
-                    break
-
-                round_shippers = []
-                ref_positions = {}
-                estimated_elapsed = {}
-                routes_cache = {}
-
-                for s in shippers:
-                    current_count = len(s.bag) + len(assigned_map[s.id])
-                    if current_count < s.K_max:
-                        round_shippers.append(s)
-                        route = self._build_route_for_shipper(s, assigned_map[s.id], obs, limit=8)
-                        routes_cache[s.id] = route
-                        if route:
-                            ref_positions[s.id] = route[-1][0]
-                            elapsed = 0
-                            curr = s.position
-                            for stop_pos, _, _ in route:
-                                elapsed += self._dist(curr, stop_pos)
-                                curr = stop_pos
-                            estimated_elapsed[s.id] = elapsed
-                        else:
-                            ref_positions[s.id] = s.position
-                            estimated_elapsed[s.id] = 0
-
-                if not round_shippers:
-                    break
-
-                C = []
-                for s in round_shippers:
-                    ref_pos = ref_positions[s.id]
-                    elapsed = estimated_elapsed[s.id]
-                    row_cost = []
-                    for o in unassigned_active:
-                        d_pick = self._dist(ref_pos, (o.sx, o.sy))
-                        d_drop = self._dist((o.sx, o.sy), (o.ex, o.ey))
-                        eta = obs_t + elapsed + d_pick + d_drop
+                                
+                    if not feasible:
+                        row_cost.append(1e9)
+                        continue
                         
-                        if d_pick >= INF or d_drop >= INF:
-                            cost = 1e9
-                        elif eta - o.et > max(self.max_delivery_delay, int(self.env.N * 1.5)):
-                            cost = 1e9
-                        else:
-                            reward = delivery_reward(o, eta, self.env.T)
-                            if reward < MIN_EXPECTED_REWARD:
-                                cost = 1e9
-                            else:
-                                lateness = max(0, eta - o.et)
-                                cost = (d_pick + d_drop) * 1.0 + lateness * 2.5 - reward * 40.0 - o.p * 8.0
-                        row_cost.append(cost)
-                    C.append(row_cost)
+                    new_util = self._evaluate_route_utility(s, route_new, obs)
+                    marginal_util = new_util - baseline_util
+                    
+                    # We want to maximize marginal utility, so cost is -marginal_util
+                    row_cost.append(-marginal_util)
+                C.append(row_cost)
 
-                row_ind, col_ind = linear_sum_assignment(C)
+            row_ind, col_ind = linear_sum_assignment(C)
 
-                matches = []
-                for r, c in zip(row_ind, col_ind):
-                    if C[r][c] < 1e8:
-                        matches.append((C[r][c], r, c))
-                matches.sort()
+            matches = []
+            for r, c in zip(row_ind, col_ind):
+                if C[r][c] < 1e8:
+                    utility = -C[r][c]
+                    if utility > 0:
+                        matches.append((utility, r, c))
+            
+            if not matches:
+                break
+                
+            matches.sort(key=lambda item: -item[0]) # Sort by descending utility
 
-                any_assigned = False
-                for cost, r, c in matches:
-                    s = round_shippers[r]
-                    o = unassigned_active[c]
-                    current_weight = sum(orders[oid].w for oid in s.bag if oid in orders) + sum(ao.w for ao in assigned_map[s.id])
-                    if current_weight + o.w <= s.W_max:
-                        assigned_map[s.id].append(o)
-                        any_assigned = True
-
-                if not any_assigned:
-                    break
+            any_assigned = False
+            for utility, r, c in matches:
+                s = round_shippers[r]
+                o = unassigned_active[c]
+                current_weight = sum(orders[oid].w for oid in s.bag if oid in orders) + sum(ao.w for ao in assigned_map[s.id])
+                if current_weight + o.w <= s.W_max:
+                    assigned_map[s.id].append(o)
+                    any_assigned = True
+                    
+            if not any_assigned:
+                break
 
         routes: Dict[int, List[RouteStop]] = {}
         for s in shippers:
@@ -884,7 +1017,7 @@ class VRPOrToolsSolver(Solver):
 
     def _planned_stop_action(self, stop: RouteStop, s: Shipper, obs: dict) -> Action:
         pos, op, _ = stop
-        return self._navigate_to(s.position, pos, cargo_op_at_goal=op)
+        return self._navigate_to(s, pos, cargo_op_at_goal=op)
 
     def _step_action(self, s: Shipper, obs: dict) -> Action:
         """
@@ -903,24 +1036,7 @@ class VRPOrToolsSolver(Solver):
 
             if tgt_queue:
                 stop = tgt_queue[0]
-                goal, op, _ = stop
-                vrp_dist = self._dist(s.position, goal)
-
-                # Với delivery đang mang, tôn trọng route vì đó là ràng buộc thực.
-                if op == 2:
-                    return self._planned_stop_action(stop, s, obs)
-
-                # Với pickup, nếu route quá xa so với cơ hội live gần nhất thì
-                # bỏ để giữ tính phản ứng online.
-                greedy_dist = INF
-                for o in orders.values():
-                    if not o.picked and not o.delivered and s.can_carry(o, orders):
-                        d = self._dist(s.position, (o.sx, o.sy))
-                        if d < greedy_dist:
-                            greedy_dist = d
-
-                if vrp_dist <= max(greedy_dist * 1.5, greedy_dist + 3):
-                    return self._planned_stop_action(stop, s, obs)
+                return self._planned_stop_action(stop, s, obs)
 
         # --- Priority 2: Deliver đơn đang mang nếu route trống/hỏng ---
         carried = [
@@ -933,24 +1049,31 @@ class VRPOrToolsSolver(Solver):
             if best is None:
                 return ("S", 0)
             goal = (best.ex, best.ey)
-            return self._navigate_to(s.position, goal, cargo_op_at_goal=2)
+            return self._navigate_to(s, goal, cargo_op_at_goal=2)
 
-        # --- Priority 3: Greedy fallback ---
+        # --- Priority 3: Reposition if surge ---
+        if len(s.bag) == 0 and self.detector.is_surge and self.detector.predicted_hotspots:
+            best_hotspot = min(
+                self.detector.predicted_hotspots,
+                key=lambda hp: self._dist(s.position, hp)
+            )
+            if best_hotspot != s.position:
+                self._shipper_goals[s.id] = best_hotspot
+                return self._navigate_to(s, best_hotspot, cargo_op_at_goal=0)
+
+        # --- Priority 4: Greedy fallback ---
         return self._greedy_pick(s, obs)
 
 
-    def _navigate_to(self, pos: Position, goal: Position, cargo_op_at_goal: int) -> Action:
+    def _navigate_to(self, s: Shipper, goal: Position, cargo_op_at_goal: int) -> Action:
         """Di chuyển 1 bước về phía goal. Nếu đã tới → thực hiện cargo_op."""
+        pos = s.position
         if pos == goal:
             return ("S", cargo_op_at_goal)
-        moves = self._path(pos, goal)
-        if not moves:
-            return ("S", 0)
-        mv = moves[0]
-        nxt = valid_next_pos(pos, mv, self.grid)
-        if nxt == goal:
-            return (mv, cargo_op_at_goal)
-        return (mv, 0)
+        move, next_pos = self._move_towards(s, goal)
+        if next_pos == goal:
+            return (move, cargo_op_at_goal)
+        return (move, 0)
 
     def _live_cargo_op(self, pos: Position, s: Shipper, obs: dict) -> int:
         """Xác định cargo_op tại pos từ live obs."""
@@ -1093,14 +1216,37 @@ class VRPOrToolsSolver(Solver):
             self._targets[s.id] = deque()
 
         self._last_plan_t = -self._replan_interval
+        self._seen_order_ids = set()
+        self.detector = OnlineSurgeHotspotDetector(
+            self.env.N, len(obs["shippers"]), obs["G"], self.env.T, self.grid
+        )
 
         while not obs.get("done", False):
+            orders = obs["orders"]
+            shippers_list = obs["shippers"]
+            current_t = obs.get("t", 0)
+            
+            # Cập nhật detector
+            current_order_ids = set(orders.keys())
+            new_order_ids = list(current_order_ids - self._seen_order_ids)
+            self._seen_order_ids.update(current_order_ids)
+            self.detector.update(current_t, new_order_ids, orders)
+
+            # Thiết lập biến tránh kẹt nút cổ chai
+            self._all_shippers = shippers_list
+            self._all_shipper_positions = {s.position for s in shippers_list}
+            self._shipper_goals = {}
+            for s in shippers_list:
+                tgt_queue = self._targets.get(s.id)
+                if tgt_queue and len(tgt_queue) > 0:
+                    self._shipper_goals[s.id] = tgt_queue[0][0]
+                else:
+                    self._shipper_goals[s.id] = s.position
+
             if self._should_replan(obs):
                 self._replan(obs)
 
             # Cleanup assignments for picked or delivered orders, or stale targets
-            orders = obs["orders"]
-            shippers_list = obs["shippers"]
             for oid in list(self._assignment.keys()):
                 o = orders.get(oid)
                 if o is None or o.picked or o.delivered:
@@ -1120,6 +1266,10 @@ class VRPOrToolsSolver(Solver):
             actions: Dict[int, Action] = {}
             for s in sorted(obs["shippers"], key=lambda s: s.id):
                 actions[s.id] = self._step_action(s, obs)
+
+            # Giải quyết xung đột/đối đầu giữa các shipper
+            goals = {s.id: self._shipper_goals.get(s.id, s.position) for s in shippers_list}
+            actions = self._resolve_deadlocks(shippers_list, actions, goals)
 
             obs, _, done, _ = self.env.step(actions)
             if done:
