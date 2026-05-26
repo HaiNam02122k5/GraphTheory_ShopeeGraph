@@ -155,10 +155,10 @@ def linear_sum_assignment(cost_matrix):
 # VRPOrToolsSolver
 # ===========================================================================
 
-class VRPOrToolsSolver_t(Solver):
+class VRPOrToolsSolver(Solver):
     """Rolling-Horizon VRP + OR-Tools solver cho Online MAPD."""
 
-    method_name = "VRPOrToolsSolver_t"
+    method_name = "VRPOrToolsSolver"
 
     def __init__(self, env: DeliveryEnv):
         super().__init__(env)
