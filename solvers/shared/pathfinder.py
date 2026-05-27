@@ -77,7 +77,7 @@ class PathFinder:
             visited[diag_indices, diag_indices] = True
 
             frontier = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
-            for c in range(4):
+            for c in [3, 2, 1, 0]:  # Loop backwards to let smaller c (U < D < L < R) overwrite larger ones
                 neighbors = adj[:, c]
                 valid = neighbors < V
                 if valid.any():
@@ -91,16 +91,24 @@ class PathFinder:
             # 4. Multi-Source Parallel BFS loop
             for d in range(2, min(V, N * 6)):
                 new_frontier = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
-                already_reached = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
+                candidates = torch.full((4, V + 1, V + 1), 127, dtype=torch.int8, device=device)
+                reached_any = False
                 for c in range(4):
-                    reached = (frontier[:, adj[:, c]] & ~visited) & ~already_reached
+                    reached = frontier[:, adj[:, c]] & ~visited
                     if reached.any():
-                        first_move = torch.where(reached, first_move[:, adj[:, c]], first_move)
-                        dist = torch.where(reached, torch.tensor(d, dtype=torch.int16, device=device), dist)
-                        new_frontier |= reached
-                        already_reached |= reached
-                if not new_frontier.any():
+                        candidates[c] = torch.where(reached, first_move[:, adj[:, c]], torch.tensor(127, dtype=torch.int8, device=device))
+                        reached_any = True
+                
+                if not reached_any:
                     break
+                
+                min_candidate, _ = torch.min(candidates, dim=0)
+                reached_mask = min_candidate < 127
+                
+                dist = torch.where(reached_mask, torch.tensor(d, dtype=torch.int16, device=device), dist)
+                first_move = torch.where(reached_mask, min_candidate, first_move)
+                new_frontier = reached_mask
+                
                 visited |= new_frontier
                 frontier = new_frontier
 
