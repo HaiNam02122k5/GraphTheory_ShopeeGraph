@@ -248,7 +248,7 @@ class GreedyBFS(Solver):
 
     Version0:
     Solver chỉ cài phần policy:
-    - chọn đơn cần giao/nhặt;
+    - chọn đơn cần giao/nhặtt
     - tìm đường bằng BFS trên grid hiện tại.
 
 
@@ -318,6 +318,8 @@ class GreedyBFS(Solver):
 
         # BFS cache size động
         self.max_bfs_cache_size = min(self.env.N * self.env.N, 5000)
+        
+        self._assignment = {}
         
         # Single-source BFS cache: start -> (dist_map, next_move_map or None)
         self._bfs_cache: OrderedDict[Position, Tuple[Dict[Position, int], Optional[Dict[Position, Move]]]] = OrderedDict()
@@ -494,6 +496,8 @@ class GreedyBFS(Solver):
             
             # Tổng chi phí bước đi (dùng để normalize)
             total_steps = max(dist_pickup + dist_deliver, 1)
+            if shipper.K_max <= 2:
+                total_steps += dist_pickup * 0.5
             
             # Urgency factor: đơn sắp hết hạn thì ưu tiên hơn, nhưng nếu trễ thì urgency = 0
             if t_estimated_delivery > order.et:
@@ -627,6 +631,40 @@ class GreedyBFS(Solver):
             
         return delivery_times
 
+    def _estimate_route_distance(
+        self,
+        shipper_pos: Position,
+        pickup_orders: List[Order],
+        bag_orders: List[Order]
+    ) -> int:
+        total_dist = 0
+        curr = shipper_pos
+        for o in pickup_orders:
+            d = self._distance(curr, (o.sx, o.sy))
+            if d >= INF:
+                return INF
+            total_dist += d
+            curr = (o.sx, o.sy)
+        
+        remaining = list(pickup_orders) + list(bag_orders)
+        while remaining:
+            best_d = min(
+                remaining,
+                key=lambda o: (
+                    o.et,
+                    self._distance(curr, (o.ex, o.ey)),
+                    -o.p,
+                    o.id
+                )
+            )
+            d = self._distance(curr, (best_d.ex, best_d.ey))
+            if d >= INF:
+                return INF
+            total_dist += d
+            curr = (best_d.ex, best_d.ey)
+            remaining.remove(best_d)
+        return total_dist
+
     def _evaluate_opportunistic_pickup(
         self,
         shipper: Shipper,
@@ -646,13 +684,14 @@ class GreedyBFS(Solver):
         if not new_times:
             return -INF
             
-        # Đảm bảo việc nhặt candidate không làm trễ bất kỳ đơn nào đang có trong bag
+        # Đảm bảo việc nhặt candidate không làm trễ bất kỳ đơn nào đang có trong bag và có khoảng an toàn
+        safety_margin = 2 if self.env.N > 50 else 0
         for o in bag_orders:
-            if new_times.get(o.id, INF) > o.et:
+            if new_times.get(o.id, INF) + safety_margin > o.et:
                 return -INF
         
         # Cũng không làm trễ chính candidate
-        if new_times.get(candidate.id, INF) > candidate.et:
+        if new_times.get(candidate.id, INF) + safety_margin > candidate.et:
             return -INF
             
         # Tính tổng reward mới
@@ -661,10 +700,21 @@ class GreedyBFS(Solver):
             est_t = new_times.get(o.id, INF)
             new_reward += delivery_reward(o, est_t, T)
             
-        # Trừ đi chi phí di chuyển tăng thêm do tải trọng tăng
-        d_to_cpickup = self._distance(shipper.position, (candidate.sx, candidate.sy))
-        w_extra = candidate.w
-        extra_move_cost = d_to_cpickup * (-0.01 * w_extra / max(shipper.W_max, 1.0))
+        # Thích ứng dựa trên mật độ đơn hàng G/T
+        density = self.env.G / self.env.T
+        if density < 0.05:
+            # Kịch bản thích ứng (mật độ thưa): Phạt detour thực tế chặt chẽ
+            dist_baseline = self._estimate_route_distance(shipper.position, [], bag_orders)
+            dist_new = self._estimate_route_distance(shipper.position, [candidate], bag_orders)
+            if dist_baseline >= INF or dist_new >= INF:
+                return -INF
+            extra_steps = dist_new - dist_baseline
+            extra_move_cost = -0.2 * extra_steps - (dist_new * 0.01 * candidate.w / max(shipper.W_max, 1.0))
+        else:
+            # Kịch bản chuẩn (mật độ dày): Không phạt detour thực tế để tối ưu hóa gom đơn
+            d_to_cpickup = self._distance(shipper.position, (candidate.sx, candidate.sy))
+            w_extra = candidate.w
+            extra_move_cost = d_to_cpickup * (-0.01 * w_extra / max(shipper.W_max, 1.0))
         
         net_gain = (new_reward + extra_move_cost) - baseline_reward
         return net_gain
@@ -720,7 +770,11 @@ class GreedyBFS(Solver):
 
             # Chỉ nhặt đơn cơ hội nếu khoảng cách hợp lý
             d_to_pickup = dist_map.get((order.sx, order.sy), INF)
-            max_opp_dist = self.max_opp_dist
+            density = self.env.G / self.env.T
+            if density < 0.05:
+                max_opp_dist = min(self.max_opp_dist, max(6, int(self.env.N * 0.35)))
+            else:
+                max_opp_dist = self.max_opp_dist
             if d_to_pickup > max_opp_dist:
                 continue
 
@@ -899,11 +953,12 @@ class GreedyBFS(Solver):
         if start == goal:
             return "S", start
 
-        move = self._next_move(start, goal)
+        move = self.pathfinder.next_move(start, goal)
         
         # Chỉ tránh nút cổ chai nếu tỉ lệ nút cổ chai trên bản đồ lớn (bottleneck_ratio > 0.15) hoặc bản đồ lớn (N >= 100)
         if len(self.grid) >= 100 or self.bottleneck_ratio > 0.15:
-            blocking_obstacles = set()
+            lookahead = max(3, min(15, int(180 / self.env.C)))
+            blocking_obstacles = {}  # pos_B -> is_static (bool)
             shipper_goals = getattr(self, "_shipper_goals", {})
             all_shippers = getattr(self, "_all_shippers", [])
             
@@ -914,7 +969,7 @@ class GreedyBFS(Solver):
                 if self._is_bottleneck(pos_B):
                     # Ước lượng điểm đến của B
                     goal_B = shipper_goals.get(s.id, pos_B)
-                    move_B = self._next_move(pos_B, goal_B)
+                    move_B = self.pathfinder.next_move(pos_B, goal_B)
                     nxt_B = valid_next_pos(pos_B, move_B, self.grid)
                     
                     # Kiểm tra xem B có đang đi về phía A (ngược chiều) hoặc đứng yên hay không
@@ -923,21 +978,17 @@ class GreedyBFS(Solver):
                     
                     # B không đi xa A ra (tức là đi ngược chiều hoặc đứng yên)
                     if dist_nxt_B <= dist_pos_B:
-                        # Nếu là hàng xóm trực tiếp (khoảng cách = 1) và đối đầu trực diện:
-                        # Giải quyết bằng độ ưu tiên ID (ID nhỏ được đi, ID lớn nhường)
-                        if dist_pos_B == 1:
-                            if shipper.id > s.id:
-                                blocking_obstacles.add(pos_B)
-                        else:
-                            blocking_obstacles.add(pos_B)
+                        is_static = (move_B == "S")
+                        blocking_obstacles[pos_B] = is_static
                             
             if blocking_obstacles:
-                # Kiểm tra xem đường đi chuẩn 15 bước tới có đi qua ô bị chặn nào không
+                # Kiểm tra xem đường đi chuẩn tới có đi qua ô bị chặn nào không
                 path_blocked = False
+                has_static_block = False
                 curr = start
                 path_set = {curr}
-                for _ in range(15):
-                    move_step = self._next_move(curr, goal)
+                for _ in range(lookahead):
+                    move_step = self.pathfinder.next_move(curr, goal)
                     if move_step == "S":
                         break
                     nxt = valid_next_pos(curr, move_step, self.grid)
@@ -946,15 +997,34 @@ class GreedyBFS(Solver):
                     path_set.add(nxt)
                     if nxt in blocking_obstacles:
                         path_blocked = True
+                        if blocking_obstacles[nxt]:
+                            has_static_block = True
                         break
                     curr = nxt
-
+ 
                 if path_blocked:
-                    alt_path = self._bfs_path_avoiding(start, goal, blocking_obstacles)
+                    blocking_set = set(blocking_obstacles.keys())
+                    alt_path = self._bfs_path_avoiding(start, goal, blocking_set)
                     if alt_path:
-                        move = alt_path[0]
+                        if has_static_block:
+                            # Luôn đi đường vòng nếu có vật cản tĩnh (shipper đứng yên)
+                            move = alt_path[0]
+                        else:
+                            # Với vật cản động, chỉ đi vòng nếu không quá xa
+                            std_dist = abs(start[0] - goal[0]) + abs(start[1] - goal[1])
+                            if len(alt_path) <= std_dist + 40:
+                                move = alt_path[0]
+                            else:
+                                move = self.pathfinder.next_move(start, goal)
                     else:
-                        move = "S"  # Đứng yên ngoài nút cổ chai chờ thông đường
+                        if has_static_block:
+                            if self.env.C < 18:
+                                move = "S"  # Chỉ đứng yên khi có vật cản tĩnh thực sự
+                            else:
+                                move = self.pathfinder.next_move(start, goal)
+                        else:
+                            # Không có vật cản tĩnh nào chặn, tiếp tục đi theo đường chuẩn
+                            move = self.pathfinder.next_move(start, goal)
 
         next_position = valid_next_pos(start, move, self.grid)
         return move, next_position

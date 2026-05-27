@@ -37,7 +37,7 @@ MOVES: Tuple[str, ...] = ("U", "D", "L", "R")
 # ---------------------------------------------------------------------------
 # Tunable hyper-parameters
 # ---------------------------------------------------------------------------
-REPLAN_INTERVAL_SMALL = 10   # Δt cho config nhỏ (N < 18)
+REPLAN_INTERVAL_SMALL = 5   # Δt cho config nhỏ (N < 18)
 REPLAN_INTERVAL_LARGE = 15   # Δt cho config lớn (N >= 18)
 ORTOOLS_TIME_LIMIT_S  = 5    # Giới hạn thời gian OR-Tools (giây)
 MAX_ACTIVE_ORDERS_SMALL = 150  # N < 50
@@ -251,8 +251,8 @@ class VRPOrToolsSolver(Solver):
             return y_pts[-1]
 
         if env.N > 50:
-            self.max_delivery_delay = 180
-            self.max_opp_dist = 30
+            self.max_opp_dist = max(30, int(round(avg_dist * 0.95)))
+            self.max_delivery_delay = max(180, int(round(avg_dist * 4.5)))
         elif env.N > 18:
             self.max_delivery_delay = 60
             self.max_opp_dist = 25
@@ -569,73 +569,7 @@ class VRPOrToolsSolver(Solver):
                 mat[j][i] = d
         return mat
 
-    # -----------------------------------------------------------------------
-    # Greedy fallback (dùng khi OR-Tools thất bại)
-    # -----------------------------------------------------------------------
 
-    def _greedy_fallback(self, obs: dict) -> Dict[int, Action]:
-        """
-        Fallback về Greedy BFS đơn giản.
-        Logic: delivery trước, pickup sau, idle = đứng yên.
-        """
-        orders: Dict[int, Order] = obs["orders"]
-        shippers: List[Shipper] = obs["shippers"]
-        obs_t: int = obs["t"]
-
-        actions: Dict[int, Action] = {}
-        reserved: set = set()
-
-        for s in sorted(shippers, key=lambda s: s.id):
-            # Giao đơn đang mang
-            carried = [
-                orders[oid]
-                for oid in s.bag
-                if oid in orders and not orders[oid].delivered
-            ]
-            if carried:
-                best = self._select_delivery_order(s, orders)
-                if best is None:
-                    actions[s.id] = ("S", 0)
-                    continue
-                goal = (best.ex, best.ey)
-                mv = self._path(s.position, goal)
-                move = mv[0] if mv else "S"
-                nxt = valid_next_pos(s.position, move, self.grid)
-                actions[s.id] = (move, 2) if nxt == goal else (move, 0)
-                continue
-
-            # Nhặt đơn
-            cands = []
-            for o in orders.values():
-                if o.id in reserved or not s.can_carry(o, orders):
-                    continue
-                d = self._dist(s.position, (o.sx, o.sy))
-                if d >= INF:
-                    continue
-                d2 = self._dist((o.sx, o.sy), (o.ex, o.ey))
-                if obs_t + d + d2 - o.et > self.max_delivery_delay:
-                    continue
-                score = self._pickup_score(s.position, o, obs_t)
-                if score <= 0.0:
-                    continue
-                cands.append((score, d, o))
-
-            if cands:
-                _, _, best = max(
-                    cands,
-                    key=lambda item: (item[0], -item[1], -item[2].id),
-                )
-                reserved.add(best.id)
-                goal = (best.sx, best.sy)
-                mv = self._path(s.position, goal)
-                move = mv[0] if mv else "S"
-                nxt = valid_next_pos(s.position, move, self.grid)
-                actions[s.id] = (move, 1) if nxt == goal else (move, 0)
-                continue
-
-            actions[s.id] = ("S", 0)
-
-        return actions
 
     # -----------------------------------------------------------------------
     # VRP planner (OR-Tools)
@@ -650,7 +584,7 @@ class VRPOrToolsSolver(Solver):
         
         if limit is None:
             compact_mid_map = 12 <= self.env.N < 18
-            route_limit = 4 if compact_mid_map else MAX_HEURISTIC_STOPS
+            route_limit = 8 if compact_mid_map else MAX_HEURISTIC_STOPS
         else:
             route_limit = limit
             
@@ -743,7 +677,7 @@ class VRPOrToolsSolver(Solver):
                     )
 
         # Chỉ chạy backtracking nếu tổng số các stops cần xem xét không quá lớn để tránh quá tải đệ quy
-        if total_possible_stops <= 10:
+        if total_possible_stops <= 7:
             search(
                 s.position, 0, sum(o.w for o in carried), len(carried),
                 [], initial_carried, initial_pickups, initial_deliveries, 0
@@ -875,11 +809,13 @@ class VRPOrToolsSolver(Solver):
             max_act = 150 if self.env.N > 50 else self.max_active_orders
             unpicked = unpicked[:max_act]
 
-        # Bộ lọc khoảng cách động theo N
+        # Bộ lọc khoảng cách động theo N và C (số lượng shipper)
+        num_shippers = len(shippers)
+        dist_factor = 2.0 if num_shippers <= 3 else 1.0
         if self.env.N > 50:
-            max_dist = max(45, self.max_opp_dist * 1.5)
+            max_dist = max(45, self.max_opp_dist * 1.5) * dist_factor
         elif self.env.N > 18:
-            max_dist = max(30, self.max_opp_dist * 1.8)
+            max_dist = max(30, self.max_opp_dist * 1.8) * dist_factor
         else:
             max_dist = 999.0
 
@@ -1007,154 +943,7 @@ class VRPOrToolsSolver(Solver):
                 
         return best_dist, best_end_pos
 
-    def _run_fast_assignment(self, obs: dict) -> Optional[Dict[int, List[RouteStop]]]:
-        """
-        Fast assignment: dùng _pickup_score scalar làm cost matrix thay vì
-        build full route cho mỗi cặp (shipper, order).
-        Giảm complexity từ O(C×G×route_build) xuống O(C×G) scalars.
-        """
-        orders: Dict[int, Order] = obs["orders"]
-        shippers: List[Shipper] = obs["shippers"]
-        obs_t: int = obs["t"]
 
-        unpicked = [
-            o for o in orders.values()
-            if not o.picked and not o.delivered
-        ]
-
-        if not unpicked and not any(s.bag for s in shippers):
-            return None
-
-        # Rộng hơn cho map lớn để giao được nhiều đơn hơn
-        deadline_slack = self.max_delivery_delay + 30
-
-        # Sắp xếp theo urgency: deadline gần trước, priority cao trước
-        if unpicked:
-            unpicked.sort(key=lambda o: (o.et - obs_t, -o.p))
-            max_act = 150 if self.env.N > 50 else self.max_active_orders
-            unpicked = unpicked[:max_act]
-
-        # --- Bảo lưu assignment từ plan cũ (anti-thrashing) ---
-        assigned_map: Dict[int, List[Order]] = {s.id: [] for s in shippers}
-        preserved_ids: Set[int] = set()
-
-        shipper_map = {s.id: s for s in shippers}
-        for oid, sid in list(self._assignment.items()):
-            o = orders.get(oid)
-            if o is None or o.picked or o.delivered:
-                continue
-            s_obj = shipper_map.get(sid)
-            if s_obj is None:
-                continue
-            current_w = sum(orders[x].w for x in s_obj.bag if x in orders)
-            current_w += sum(ao.w for ao in assigned_map[sid])
-            if current_w + o.w <= s_obj.W_max and len(s_obj.bag) + len(assigned_map[sid]) < s_obj.K_max:
-                assigned_map[sid].append(o)
-                preserved_ids.add(oid)
-
-        # Loại các đơn đã preserved khỏi pool
-        unassigned_pool = [o for o in unpicked if o.id not in preserved_ids]
-
-        # --- Multi-round Hungarian assignment ---
-        max_rounds = max(s.K_max for s in shippers)
-        for _round in range(max_rounds):
-            already_assigned_ids = preserved_ids | {
-                o.id for orders_list in assigned_map.values() for o in orders_list
-            }
-            unassigned_active = [o for o in unassigned_pool if o.id not in already_assigned_ids]
-            if not unassigned_active:
-                break
-
-            round_shippers = [
-                s for s in shippers
-                if len(s.bag) + len(assigned_map[s.id]) < s.K_max
-            ]
-            if not round_shippers:
-                break
-
-            # Build cost matrix bằng _pickup_score — O(1) mỗi cell
-            C = []
-            for s in round_shippers:
-                current_weight = (
-                    sum(orders[oid].w for oid in s.bag if oid in orders)
-                    + sum(ao.w for ao in assigned_map[s.id])
-                )
-                
-                # Ước tính thời gian giao xong bag hiện tại và vị trí kết thúc
-                elapsed_est, end_pos = self._estimate_bag_delivery(s, orders)
-
-                row_cost = []
-                for o in unassigned_active:
-                    # Kiểm tra weight/capacity
-                    if current_weight + o.w > s.W_max:
-                        row_cost.append(1e9)
-                        continue
-                        
-                    # Tính khoảng cách từ end_pos (sau khi giao xong bag) tới pickup mới
-                    d_pick = self._dist(end_pos, (o.sx, o.sy))
-                    d_drop = self._dist((o.sx, o.sy), (o.ex, o.ey))
-                    if d_pick >= INF or d_drop >= INF:
-                        row_cost.append(1e9)
-                        continue
-                        
-                    eta = obs_t + elapsed_est + d_pick + d_drop
-                    if eta - o.et > deadline_slack:
-                        row_cost.append(1e9)
-                        continue
-                        
-                    reward = delivery_reward(o, eta, self.env.T)
-                    if reward <= 0.0:
-                        row_cost.append(1e9)
-                        continue
-                        
-                    score = reward / (d_pick + d_drop + 1) + 0.05 * o.p
-                    if eta <= o.et:
-                        score *= 2.0
-                    else:
-                        score -= (eta - o.et) * 0.1
-                        
-                    if score <= 0.0:
-                        row_cost.append(1e9)
-                        continue
-                        
-                    row_cost.append(-score)  # minimize → maximize score
-                C.append(row_cost)
-
-            if not C or not C[0]:
-                break
-
-            row_ind, col_ind = linear_sum_assignment(C)
-
-            matches = [
-                (-C[r][c], r, c)
-                for r, c in zip(row_ind, col_ind)
-                if C[r][c] < 1e8
-            ]
-            if not matches:
-                break
-            matches.sort(key=lambda x: -x[0])  # descending score
-
-            any_assigned = False
-            for score, r, c in matches:
-                s = round_shippers[r]
-                o = unassigned_active[c]
-                current_weight = (
-                    sum(orders[oid].w for oid in s.bag if oid in orders)
-                    + sum(ao.w for ao in assigned_map[s.id])
-                )
-                if current_weight + o.w <= s.W_max:
-                    assigned_map[s.id].append(o)
-                    any_assigned = True
-
-            if not any_assigned:
-                break
-
-        # Build route greedy cho từng shipper (chỉ 1 lần sau assignment)
-        routes: Dict[int, List[RouteStop]] = {}
-        for s in shippers:
-            routes[s.id] = self._build_route_for_shipper(s, assigned_map[s.id], obs)
-
-        return routes if any(routes.values()) else None
 
 
 
@@ -1384,19 +1173,41 @@ class VRPOrToolsSolver(Solver):
 
     def _should_replan(self, obs: dict) -> bool:
         t = obs["t"]
-        if t - self._last_plan_t >= self._replan_interval:
+        time_since_last = t - self._last_plan_t
+        if time_since_last >= self._replan_interval:
             return True
-        if obs.get("new_order_ids"):
-            return True
+
         shippers = obs["shippers"]
         orders = obs["orders"]
+
+        # Kiểm tra xem có shipper nào rảnh hoàn toàn không (không bag, không target)
+        has_idle_shipper = False
+        for s in shippers:
+            carried = [oid for oid in s.bag if oid in orders and not orders[oid].delivered]
+            if not carried and not self._targets.get(s.id):
+                has_idle_shipper = True
+                break
+
         has_unassigned = any(
             not o.picked and not o.delivered for o in orders.values()
         )
+
+        if has_idle_shipper and has_unassigned:
+            return True
+
+        # Áp dụng cooldown tối thiểu để tránh replan quá dày đặc
+        min_cooldown = min(5, self._replan_interval)
+        if time_since_last < min_cooldown:
+            return False
+
+        if obs.get("new_order_ids") and has_unassigned:
+            return True
+
         if has_unassigned:
             for s in shippers:
                 if not self._targets.get(s.id):
                     return True
+
         return False
 
     def _replan(self, obs: dict) -> None:

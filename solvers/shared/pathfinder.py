@@ -30,6 +30,8 @@ class PathFinder:
         self._bfs_cache: Dict[Tuple[Tuple[int, int], Tuple[int, int]], Tuple[int, List[str]]] = {}
         self._distance_cache: Dict[Tuple[Tuple[int, int], Tuple[int, int]], int] = {}
         self._next_move_cache: Dict[Tuple[Tuple[int, int], Tuple[int, int]], str] = {}
+        self._bfs_fully_computed: Set[Tuple[int, int]] = set()
+        self._parent_maps: Dict[Tuple[int, int], Dict[Tuple[int, int], Tuple[Optional[Tuple[int, int]], str]]] = {}
         
         self.has_torch = self._precompute_with_torch(grid)
 
@@ -110,40 +112,36 @@ class PathFinder:
         except Exception:
             return False
 
-    def _fallback_bfs(self, start: Tuple[int, int], goal: Tuple[int, int]) -> Tuple[int, List[str]]:
-        if start == goal:
-            return 0, []
+    def _single_source_bfs(self, start: Tuple[int, int]) -> None:
+        if start in self._bfs_fully_computed:
+            return
+
         from env import is_valid_cell, valid_next_pos
-        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
-            return 10**9, []
+        if not is_valid_cell(start, self.grid):
+            self._bfs_fully_computed.add(start)
+            return
 
         parent: Dict[Tuple[int, int], Tuple[Optional[Tuple[int, int]], str]] = {start: (None, "S")}
         queue = deque([start])
+        queue_append = queue.append
+        queue_popleft = queue.popleft
         moves_list = ("U", "D", "L", "R")
+        dist_map = {start: 0}
 
-        found = False
         while queue:
-            cur = queue.popleft()
-            if cur == goal:
-                found = True
-                break
+            cur = queue_popleft()
+            d_cur = dist_map[cur]
+            self._distance_cache[(start, cur)] = d_cur
+
             for mv in moves_list:
                 nxt = valid_next_pos(cur, mv, self.grid)
                 if nxt != cur and nxt not in parent:
                     parent[nxt] = (cur, mv)
-                    queue.append(nxt)
+                    dist_map[nxt] = d_cur + 1
+                    queue_append(nxt)
 
-        if not found or goal not in parent:
-            return 10**9, []
-
-        moves = []
-        cur = goal
-        while cur != start:
-            prev, mv = parent[cur]
-            moves.append(mv)
-            cur = prev  # type: ignore
-        moves.reverse()
-        return len(moves), moves
+        self._parent_maps[start] = parent
+        self._bfs_fully_computed.add(start)
 
     def dist(self, start: Tuple[int, int], goal: Tuple[int, int]) -> int:
         if self.has_torch:
@@ -156,11 +154,12 @@ class PathFinder:
             d = self.dist_matrix[s_idx, g_idx]
             return 10**9 if d >= 9999 else int(d)
         else:
+            if start == goal:
+                return 0
             key = (start, goal)
             if key not in self._distance_cache:
-                d, _ = self._fallback_bfs(start, goal)
-                self._distance_cache[key] = d
-            return self._distance_cache[key]
+                self._single_source_bfs(start)
+            return self._distance_cache.get(key, 10**9)
 
     def path(self, start: Tuple[int, int], goal: Tuple[int, int]) -> List[str]:
         if self.has_torch:
@@ -188,10 +187,24 @@ class PathFinder:
                 curr_idx = next_idx
             return path_moves
         else:
+            if start == goal:
+                return []
             key = (start, goal)
             if key not in self._bfs_cache:
-                d, p = self._fallback_bfs(start, goal)
-                self._bfs_cache[key] = (d, p)
+                if start not in self._bfs_fully_computed:
+                    self._single_source_bfs(start)
+                parent = self._parent_maps.get(start)
+                if parent is None or goal not in parent:
+                    self._bfs_cache[key] = (10**9, [])
+                else:
+                    moves = []
+                    cur = goal
+                    while cur != start:
+                        prev, mv = parent[cur]
+                        moves.append(mv)
+                        cur = prev
+                    moves.reverse()
+                    self._bfs_cache[key] = (len(moves), moves)
             return self._bfs_cache[key][1]
 
     def next_move(self, start: Tuple[int, int], goal: Tuple[int, int]) -> str:
@@ -207,6 +220,8 @@ class PathFinder:
                 return ["U", "D", "L", "R"][move_idx]
             return "S"
         else:
+            if start == goal:
+                return "S"
             key = (start, goal)
             if key not in self._next_move_cache:
                 p = self.path(start, goal)
