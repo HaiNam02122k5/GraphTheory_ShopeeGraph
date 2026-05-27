@@ -222,3 +222,11 @@ results/
 .agents/
 .agents/tmp/
 
+graphify-out/
+
+results_debug/
+
+scratch/
+
+
+
