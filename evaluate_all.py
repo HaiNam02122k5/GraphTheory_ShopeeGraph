@@ -44,7 +44,7 @@ def main():
     }
     
     scenarios = ["shipper", "adaptability", "weight", "balanced", "topology", "deadline", "multilane", "advanced"]
-    config_types = ["default"]
+    config_types = ["large"]
     
     all_results = []
     
