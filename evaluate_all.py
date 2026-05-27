@@ -35,12 +35,12 @@ def _run_solver(solver_cls: Any, cfg: dict, seed: int) -> dict:
 
 def main():
     print("Loading solver classes...")
-    VRP_cls = load_solver_class("VRPOrToolsSolver_t", "vrp_ortools_t.py")
-    BFS_cls = load_solver_class("GreedyBFS_t", "greedy_bfs_t.py")
+    VRP_cls = load_solver_class("VRPOrToolsSolver", "vrp_ortools.py")
+    BFS_cls = load_solver_class("GreedyBFS", "greedy_bfs.py")
     
     solvers = {
-        "VRPOrToolsSolver_t": VRP_cls,
-        "GreedyBFS_t": BFS_cls
+        "VRPOrToolsSolver": VRP_cls,
+        "GreedyBFS": BFS_cls
     }
     
     scenarios = ["shipper", "adaptability", "weight", "balanced", "topology", "deadline", "multilane", "advanced"]
