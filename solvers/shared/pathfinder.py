@@ -36,75 +36,79 @@ class PathFinder:
     def _precompute_with_torch(self, grid: List[List[int]]) -> bool:
         try:
             import torch
+            import numpy as np
         except ImportError:
             return False
 
-        # Use GPU if available, else CPU
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        N = self.N
-        
-        # 1. Filter free cells and map them to 1D index
-        free_cells = [(r, c) for r in range(N) for c in range(N) if grid[r][c] == 0]
-        V = len(free_cells)
-        self.cell_to_idx = {cell: i for i, cell in enumerate(free_cells)}
-        self.idx_to_cell = free_cells
+        try:
+            # Use GPU if available, else CPU
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            N = self.N
+            
+            # 1. Filter free cells and map them to 1D index
+            free_cells = [(r, c) for r in range(N) for c in range(N) if grid[r][c] == 0]
+            V = len(free_cells)
+            self.cell_to_idx = {cell: i for i, cell in enumerate(free_cells)}
+            self.idx_to_cell = free_cells
 
-        # 2. Build adjacency tensor of shape (V+1, 4)
-        # Directions: 0: U, 1: D, 2: L, 3: R. Index V is used as dummy/padding
-        adj = torch.full((V + 1, 4), V, dtype=torch.long, device=device)
-        moves_offset = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            # 2. Build adjacency tensor of shape (V+1, 4)
+            # Directions: 0: U, 1: D, 2: L, 3: R. Index V is used as dummy/padding
+            adj = torch.full((V + 1, 4), V, dtype=torch.long, device=device)
+            moves_offset = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
-        for idx, (r, c) in enumerate(free_cells):
-            for dir_idx, (dr, dc) in enumerate(moves_offset):
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < N and 0 <= nc < N and grid[nr][nc] == 0:
-                    adj[idx, dir_idx] = self.cell_to_idx[(nr, nc)]
+            for idx, (r, c) in enumerate(free_cells):
+                for dir_idx, (dr, dc) in enumerate(moves_offset):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < N and 0 <= nc < N and grid[nr][nc] == 0:
+                        adj[idx, dir_idx] = self.cell_to_idx[(nr, nc)]
 
-        # 3. Initialize distance, first-step, visited, and frontier matrices (all shape V+1 x V+1)
-        dist = torch.full((V + 1, V + 1), 9999, dtype=torch.int16, device=device)
-        first_move = torch.full((V + 1, V + 1), 4, dtype=torch.int8, device=device) # 4 is Stay ('S')
+            # 3. Initialize distance, first-step, visited, and frontier matrices (all shape V+1 x V+1)
+            dist = torch.full((V + 1, V + 1), 9999, dtype=torch.int16, device=device)
+            first_move = torch.full((V + 1, V + 1), 4, dtype=torch.int8, device=device) # 4 is Stay ('S')
 
-        # Diagonal distance is 0 for all nodes (including dummy node V)
-        diag_indices = torch.arange(V + 1, device=device)
-        dist[diag_indices, diag_indices] = 0
+            # Diagonal distance is 0 for all nodes (including dummy node V)
+            diag_indices = torch.arange(V + 1, device=device)
+            dist[diag_indices, diag_indices] = 0
 
-        # Visited and frontier initialization
-        visited = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
-        visited[diag_indices, diag_indices] = True
+            # Visited and frontier initialization
+            visited = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
+            visited[diag_indices, diag_indices] = True
 
-        frontier = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
-        for c in range(4):
-            neighbors = adj[:, c]
-            valid = neighbors < V
-            if valid.any():
-                src_indices = torch.arange(V + 1, device=device)[valid]
-                dest_indices = neighbors[valid]
-                dist[src_indices, dest_indices] = 1
-                first_move[src_indices, dest_indices] = c
-                frontier[src_indices, dest_indices] = True
-                visited[src_indices, dest_indices] = True
-
-        # 4. Multi-Source Parallel BFS loop
-        for d in range(2, min(V, N * 6)):
-            new_frontier = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
-            already_reached = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
+            frontier = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
             for c in range(4):
-                reached = (frontier[:, adj[:, c]] & ~visited) & ~already_reached
-                if reached.any():
-                    first_move = torch.where(reached, first_move[:, adj[:, c]], first_move)
-                    dist = torch.where(reached, torch.tensor(d, dtype=torch.int16, device=device), dist)
-                    new_frontier |= reached
-                    already_reached |= reached
-            if not new_frontier.any():
-                break
-            visited |= new_frontier
-            frontier = new_frontier
+                neighbors = adj[:, c]
+                valid = neighbors < V
+                if valid.any():
+                    src_indices = torch.arange(V + 1, device=device)[valid]
+                    dest_indices = neighbors[valid]
+                    dist[src_indices, dest_indices] = 1
+                    first_move[src_indices, dest_indices] = c
+                    frontier[src_indices, dest_indices] = True
+                    visited[src_indices, dest_indices] = True
 
-        # 5. Extract matrices to CPU numpy for fast lookups
-        self.dist_matrix = dist[:V, :V].cpu().numpy()
-        self.next_move_matrix = first_move[:V, :V].cpu().numpy()
-        self.adj_cpu = adj[:V].cpu().numpy()
-        return True
+            # 4. Multi-Source Parallel BFS loop
+            for d in range(2, min(V, N * 6)):
+                new_frontier = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
+                already_reached = torch.zeros((V + 1, V + 1), dtype=torch.bool, device=device)
+                for c in range(4):
+                    reached = (frontier[:, adj[:, c]] & ~visited) & ~already_reached
+                    if reached.any():
+                        first_move = torch.where(reached, first_move[:, adj[:, c]], first_move)
+                        dist = torch.where(reached, torch.tensor(d, dtype=torch.int16, device=device), dist)
+                        new_frontier |= reached
+                        already_reached |= reached
+                if not new_frontier.any():
+                    break
+                visited |= new_frontier
+                frontier = new_frontier
+
+            # 5. Extract matrices to CPU numpy for fast lookups
+            self.dist_matrix = dist[:V, :V].cpu().numpy()
+            self.next_move_matrix = first_move[:V, :V].cpu().numpy()
+            self.adj_cpu = adj[:V].cpu().numpy()
+            return True
+        except Exception:
+            return False
 
     def _fallback_bfs(self, start: Tuple[int, int], goal: Tuple[int, int]) -> Tuple[int, List[str]]:
         if start == goal:
