@@ -51,6 +51,7 @@ LATE_COST_SCALE       = 25   # Soft deadline penalty trên mỗi timestep trễ
 
 
 from solvers.shared.pathfinder import get_pathfinder
+from solvers.shared.precompute import get_precompute
 from solvers.shared.detector import OnlineSurgeHotspotDetector
 
 try:
@@ -165,6 +166,7 @@ class VRPOrToolsSolver(Solver):
 
         # Khởi tạo PathFinder tăng tốc bởi GPU/CPU
         self.pathfinder = get_pathfinder(self.grid)
+        self.precompute = get_precompute(self.grid)
 
         # Kế hoạch hiện tại: shipper_id → deque of (target_pos, cargo_op)
         self._plans: Dict[int, deque] = {}
@@ -196,14 +198,8 @@ class VRPOrToolsSolver(Solver):
         self._adj = adj
 
         # Thống kê bottleneck ratio để tránh tắc nghẽn
-        def local_is_bottleneck(pos):
-            r, c = pos
-            return sum(
-                1 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
-                if 0 <= r + dr < len(self.grid) and 0 <= c + dc < len(self.grid[0]) and self.grid[r + dr][c + dc] == 0
-            ) <= 2
         free_cells = list(adj.keys())
-        bn_count = sum(1 for pos in free_cells if local_is_bottleneck(pos))
+        bn_count = sum(1 for pos in free_cells if self.precompute.is_bottleneck(pos))
         self.bottleneck_ratio = bn_count / len(free_cells) if free_cells else 0.0
 
         # Khởi tạo detector
@@ -270,21 +266,23 @@ class VRPOrToolsSolver(Solver):
 
     def _bfs(self, start: Position, goal: Position) -> Tuple[int, List[Move]]:
         """BFS với cache."""
+        if not self.precompute.are_connected(start, goal):
+            return INF, []
         return self.pathfinder.dist(start, goal), self.pathfinder.path(start, goal)
 
     def _dist(self, a: Position, b: Position) -> int:
+        if not self.precompute.are_connected(a, b):
+            return INF
         return self.pathfinder.dist(a, b)
 
     def _path(self, a: Position, b: Position) -> List[Move]:
+        if not self.precompute.are_connected(a, b):
+            return []
         return self.pathfinder.path(a, b)
 
     def _is_bottleneck(self, pos: Position) -> bool:
         """Kiểm tra ô pos có phải nút cổ chai (<= 2 ô trống xung quanh) hay không."""
-        r, c = pos
-        return sum(
-            1 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
-            if 0 <= r + dr < len(self.grid) and 0 <= c + dc < len(self.grid[0]) and self.grid[r + dr][c + dc] == 0
-        ) <= 2
+        return self.precompute.is_bottleneck(pos)
 
     def _bfs_path_avoiding(self, start: Position, goal: Position, other_positions: Set[Position]) -> Optional[List[Move]]:
         if start == goal:
@@ -796,6 +794,12 @@ class VRPOrToolsSolver(Solver):
         unpicked = [
             o for o in orders.values()
             if not o.picked and not o.delivered
+        ]
+
+        # Lọc các đơn hàng không thể tiếp cận bởi bất kỳ shipper nào
+        unpicked = [
+            o for o in unpicked
+            if any(self.precompute.are_connected(s.position, (o.sx, o.sy)) for s in shippers)
         ]
 
         if not unpicked and not any(s.bag for s in shippers):

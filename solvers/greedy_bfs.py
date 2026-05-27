@@ -8,6 +8,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 from env import DeliveryEnv, Order, Shipper, is_valid_cell, valid_next_pos, delivery_reward
 from solvers.solver import Solver
 from solvers.shared.detector import OnlineSurgeHotspotDetector
+from solvers.shared.precompute import get_precompute
 
 # Hashing representation of grid to cache PathFinder instances
 _PATHFINDER_CACHE: Dict[Tuple[Tuple[int, ...], ...], PathFinder] = {}
@@ -30,6 +31,7 @@ class PathFinder:
     def __init__(self, grid: List[List[int]]):
         self.grid = grid
         self.N = len(grid)
+        self.precompute = get_precompute(grid)
         
         # Fallback CPU BFS caches (always initialized for safety/testing)
         self._bfs_cache: Dict[Tuple[Tuple[int, int], Tuple[int, int]], Tuple[int, List[str]]] = {}
@@ -160,9 +162,11 @@ class PathFinder:
             return False
 
     def dist(self, start: Tuple[int, int], goal: Tuple[int, int]) -> int:
+        if start == goal:
+            return 0
+        if not self.precompute.are_connected(start, goal):
+            return 10**9
         if self.has_torch:
-            if start == goal:
-                return 0
             s_idx = self.cell_to_idx.get(start)
             g_idx = self.cell_to_idx.get(goal)
             if s_idx is None or g_idx is None:
@@ -170,16 +174,16 @@ class PathFinder:
             d = self.dist_matrix[s_idx, g_idx]
             return 10**9 if d >= 9999 else int(d)
         else:
-            if start == goal:
-                return 0
             if start not in self._single_source_cache:
                 self._compute_single_source(start)
             return self._single_source_cache[start][0].get(goal, 10**9)
 
     def path(self, start: Tuple[int, int], goal: Tuple[int, int]) -> List[str]:
+        if start == goal:
+            return []
+        if not self.precompute.are_connected(start, goal):
+            return []
         if self.has_torch:
-            if start == goal:
-                return []
             s_idx = self.cell_to_idx.get(start)
             g_idx = self.cell_to_idx.get(goal)
             if s_idx is None or g_idx is None:
@@ -202,25 +206,29 @@ class PathFinder:
                 curr_idx = next_idx
             return path_moves
         else:
-            if start == goal:
-                return []
             if start not in self._single_source_cache:
                 self._compute_single_source(start)
-            dist_map, parent_map = self._single_source_cache[start]
-            if goal not in dist_map:
+            _, parent_map = self._single_source_cache[start]
+            if goal not in parent_map and goal != start:
                 return []
-            moves = []
+            
+            path_moves = []
             curr = goal
             while curr != start:
-                curr, move = parent_map[curr]
-                moves.append(move)
-            moves.reverse()
-            return moves
+                if curr not in parent_map:
+                    return []
+                parent_node, move = parent_map[curr]
+                path_moves.append(move)
+                curr = parent_node
+            path_moves.reverse()
+            return path_moves
 
     def next_move(self, start: Tuple[int, int], goal: Tuple[int, int]) -> str:
+        if start == goal:
+            return "S"
+        if not self.precompute.are_connected(start, goal):
+            return "S"
         if self.has_torch:
-            if start == goal:
-                return "S"
             s_idx = self.cell_to_idx.get(start)
             g_idx = self.cell_to_idx.get(goal)
             if s_idx is None or g_idx is None:
@@ -260,6 +268,7 @@ class GreedyBFS(Solver):
         super().__init__(env)
         # Sử dụng PathFinder dùng chung có tối ưu hóa GPU/CPU
         self.pathfinder = get_pathfinder(self.grid)
+        self.precompute = get_precompute(self.grid)
         self._adj = self.pathfinder._adj
 
         # Lấy mẫu avg_dist bằng BFS
@@ -293,7 +302,7 @@ class GreedyBFS(Solver):
         # Thiết lập max_delivery_delay động dựa trên avg_dist và bottleneck_ratio
         # Tính toán bottleneck_ratio trước
         total_free_cells = len(self._adj)
-        bottleneck_cells = sum(1 for pos in self._adj.keys() if self._is_bottleneck(pos))
+        bottleneck_cells = sum(1 for pos in self._adj.keys() if self.precompute.is_bottleneck(pos))
         self.bottleneck_ratio = bottleneck_cells / total_free_cells if total_free_cells > 0 else 0.0
 
         def interpolate(x, x_pts, y_pts):
@@ -361,6 +370,26 @@ class GreedyBFS(Solver):
         if start in self._bfs_cache and self._bfs_cache[start][1] is not None:
             return self._bfs_cache[start]
 
+        if self.pathfinder.has_torch:
+            s_idx = self.pathfinder.cell_to_idx.get(start)
+            if s_idx is None:
+                dist_map = {start: 0}
+                next_move_map = {start: "S"}
+            else:
+                dist_map = {}
+                next_move_map = {}
+                moves_list = ["U", "D", "L", "R", "S"]
+                # Cần tính hướng di chuyển đầu tiên từ start đến mọi đích nxt.
+                # next_move_matrix[s_idx, idx] cho biết bước đi đầu tiên từ start đến cell.
+                for cell, idx in self.pathfinder.cell_to_idx.items():
+                    d = self.pathfinder.dist_matrix[s_idx, idx]
+                    if d < 9999:
+                        dist_map[cell] = int(d)
+                        move_idx = self.pathfinder.next_move_matrix[s_idx, idx]
+                        next_move_map[cell] = moves_list[move_idx] if move_idx < 5 else "S"
+            self._save_bfs_cache(start, (dist_map, next_move_map))
+            return dist_map, next_move_map
+
         dist_map = {start: 0}
         next_move_map = {start: "S"}
 
@@ -397,6 +426,19 @@ class GreedyBFS(Solver):
         """Chạy BFS chỉ tính khoảng cách (không tính next move) để tối ưu hiệu năng."""
         if start in self._bfs_cache:
             return self._bfs_cache[start][0]
+
+        if self.pathfinder.has_torch:
+            s_idx = self.pathfinder.cell_to_idx.get(start)
+            if s_idx is None:
+                dist_map = {start: 0}
+            else:
+                dist_map = {}
+                for cell, idx in self.pathfinder.cell_to_idx.items():
+                    d = self.pathfinder.dist_matrix[s_idx, idx]
+                    if d < 9999:
+                        dist_map[cell] = int(d)
+            self._save_bfs_cache(start, (dist_map, None))
+            return dist_map
 
         # Nếu start là vị trí của shipper, ta tính gộp cả next_move_map
         if hasattr(self, "_all_shipper_positions") and start in self._all_shipper_positions:
@@ -525,6 +567,8 @@ class GreedyBFS(Solver):
 
         for order in orders.values():
             if order.id in reserved_order_ids:
+                continue
+            if not self.precompute.are_connected(shipper.position, (order.sx, order.sy)):
                 continue
             if not shipper.can_carry(order, orders):
                 continue
@@ -772,10 +816,15 @@ class GreedyBFS(Solver):
             d_to_pickup = dist_map.get((order.sx, order.sy), INF)
             density = self.env.G / self.env.T
             if density < 0.05:
-                max_opp_dist = min(self.max_opp_dist, max(6, int(self.env.N * 0.35)))
+                base_max_opp = min(self.max_opp_dist, max(6, int(self.env.N * 0.35)))
             else:
-                max_opp_dist = self.max_opp_dist
-            if d_to_pickup > max_opp_dist:
+                base_max_opp = self.max_opp_dist
+            
+            # Nới rộng khi map phức tạp
+            if self.avg_dist > 30:
+                base_max_opp = max(base_max_opp, int(round(self.avg_dist * 1.5)))
+                
+            if d_to_pickup > base_max_opp:
                 continue
 
             # Loại nhanh: đơn đã hết deadline không cần tính
@@ -812,6 +861,12 @@ class GreedyBFS(Solver):
         ]
         if not candidates:
             return None
+
+        # Tiền lọc Manhattan cho map lớn/phức tạp
+        should_filter = (self.env.N >= 100 or self.avg_dist > 30) and len(candidates) > 50
+        if should_filter:
+            candidates.sort(key=lambda o: abs(shipper.position[0] - o.sx) + abs(shipper.position[1] - o.sy))
+            candidates = candidates[:60]
         
         # Lấy khoảng cách BFS thực tế từ vị trí shipper
         dist_map = self._dist_bfs_from(shipper.position)
@@ -895,11 +950,7 @@ class GreedyBFS(Solver):
 
     def _is_bottleneck(self, pos: Position) -> bool:
         """Kiểm tra ô pos có phải nút cổ chai (<= 2 ô trống xung quanh) hay không."""
-        r, c = pos
-        return sum(
-            1 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
-            if 0 <= r + dr < len(self.grid) and 0 <= c + dc < len(self.grid[0]) and self.grid[r + dr][c + dc] == 0
-        ) <= 2
+        return self.precompute.is_bottleneck(pos)
 
     def _bfs_path_avoiding(self, start: Position, goal: Position, other_positions: Set[Position]) -> Optional[List[Move]]:
         if start == goal:
@@ -1124,7 +1175,10 @@ class GreedyBFS(Solver):
         while unmatched_shippers:
             candidates_for_shippers = []
             for shipper in unmatched_shippers:
-                available_orders = {oid: o for oid, o in orders.items() if oid not in reserved_pickups}
+                available_orders = {
+                    oid: o for oid, o in orders.items()
+                    if oid not in reserved_pickups and self.precompute.are_connected(shipper.position, (o.sx, o.sy))
+                }
                 pickup_order = self._plan_multi_pickup_route(shipper, available_orders, current_t)
                 if pickup_order is None:
                     pickup_order = self._select_pickup_v1(shipper, orders, reserved_pickups)
