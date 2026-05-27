@@ -339,6 +339,8 @@ class VRPOrToolsSolver(Solver):
         
         # Chỉ tránh nút cổ chai nếu tỉ lệ nút cổ chai trên bản đồ lớn (bottleneck_ratio > 0.15) hoặc bản đồ lớn (N >= 100)
         if len(self.grid) >= 100 or self.bottleneck_ratio > 0.15:
+            # lookahead động từ 3 đến 15 dựa trên số lượng shipper C
+            lookahead = max(3, min(15, int(180 / self.env.C)))
             blocking_obstacles = set()
             shipper_goals = getattr(self, "_shipper_goals", {})
             all_shippers = getattr(self, "_all_shippers", [])
@@ -368,11 +370,11 @@ class VRPOrToolsSolver(Solver):
                             blocking_obstacles.add(pos_B)
                             
             if blocking_obstacles:
-                # Kiểm tra xem đường đi chuẩn 15 bước tới có đi qua ô bị chặn nào không
+                # Kiểm tra xem đường đi chuẩn tới có đi qua ô bị chặn nào không
                 path_blocked = False
                 curr = start
                 path_set = {curr}
-                for _ in range(15):
+                for _ in range(lookahead):
                     move_step = self.pathfinder.next_move(curr, goal)
                     if move_step == "S":
                         break
@@ -390,7 +392,8 @@ class VRPOrToolsSolver(Solver):
                     if alt_path:
                         move = alt_path[0]
                     else:
-                        move = "S"  # Đứng yên ngoài nút cổ chai chờ thông đường
+                        if self.env.C < 18:
+                            move = "S"  # Chỉ đứng yên ngoài nút cổ chai chờ thông đường khi số shipper ít
  
         next_position = valid_next_pos(start, move, self.grid)
         return move, next_position
@@ -863,7 +866,7 @@ class VRPOrToolsSolver(Solver):
 
         # Bộ lọc khoảng cách động theo N
         if self.env.N > 50:
-            max_dist = max(25, self.max_opp_dist * 1.2)
+            max_dist = max(45, self.max_opp_dist * 1.5)
         elif self.env.N > 18:
             max_dist = max(20, self.max_opp_dist * 1.5)
         else:
@@ -897,6 +900,14 @@ class VRPOrToolsSolver(Solver):
                 # Ước tính vị trí rảnh tay của shipper sau khi giao xong bag
                 _, end_pos = self._estimate_bag_delivery(s, orders)
                 
+                # Chỉ nới rộng max_dist khi là map mật độ cao và shipper thực sự rảnh tay
+                is_dense_map = (self.env.G >= 1000 or self.env.C >= 20)
+                if is_dense_map and len(s.bag) == 0 and len(assigned_map[s.id]) == 0:
+                    d_min = min((self._dist(end_pos, (o_temp.sx, o_temp.sy)) for o_temp in unassigned_active), default=1e9)
+                    s_max_dist = max(max_dist, d_min + 15) if d_min < 1e8 else max_dist
+                else:
+                    s_max_dist = max_dist
+
                 row_cost = []
                 for o in unassigned_active:
                     if current_weight + o.w > s.W_max:
@@ -905,7 +916,7 @@ class VRPOrToolsSolver(Solver):
                         
                     # Lọc khoảng cách nhanh từ end_pos
                     d_pick = self._dist(end_pos, (o.sx, o.sy))
-                    if d_pick > max_dist:
+                    if d_pick > s_max_dist:
                         row_cost.append(1e9)
                         continue
                         
