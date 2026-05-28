@@ -39,10 +39,12 @@ class OnlineSurgeHotspotDetector:
             if current_t - t <= window_limit
         ]
         
-        # Xây dựng lại pickup_counts từ history
+        # Xây dựng lại pickup_counts từ history với time decay
         self.pickup_counts = {}
         for t, pos in self.pickup_history:
-            self.pickup_counts[pos] = self.pickup_counts.get(pos, 0) + 1
+            age = current_t - t
+            weight = 0.95 ** age
+            self.pickup_counts[pos] = self.pickup_counts.get(pos, 0.0) + weight
                 
         # 3. Phát hiện Surge (sliding window 20 steps)
         window_size = min(20, current_t + 1)
@@ -60,7 +62,9 @@ class OnlineSurgeHotspotDetector:
                     for dc in range(-(3 - abs(dr)), (3 - abs(dr)) + 1):
                         r, c = sx + dr, sy + dc
                         if 0 <= r < self.N and 0 <= c < self.N and self.grid[r][c] == 0:
-                            candidates[(r, c)] = candidates.get((r, c), 0) + count
+                            d = abs(dr) + abs(dc)
+                            dist_weight = 1.0 / (1.0 + d)
+                            candidates[(r, c)] = candidates.get((r, c), 0.0) + count * dist_weight
             
             sorted_candidates = sorted(candidates.items(), key=lambda item: -item[1])
             n_hotspots = min(max(1, self.C // 2), 3)
