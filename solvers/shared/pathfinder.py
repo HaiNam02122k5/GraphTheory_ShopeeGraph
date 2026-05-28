@@ -22,7 +22,7 @@ class PathFinder:
     BFS when PyTorch is not available.
     """
 
-    def __init__(self, grid: List[List[int]], force_cpu: bool = False):
+    def __init__(self, grid: List[List[int]]):
         self.grid = grid
         self.N = len(grid)
         
@@ -33,7 +33,7 @@ class PathFinder:
         self._bfs_fully_computed: Set[Tuple[int, int]] = set()
         self._parent_maps: Dict[Tuple[int, int], Dict[Tuple[int, int], Tuple[Optional[Tuple[int, int]], str]]] = {}
         
-        self.has_torch = False if force_cpu else self._precompute_with_torch(grid)
+        self.has_torch = self._precompute_with_torch(grid)
 
     def _precompute_with_torch(self, grid: List[List[int]]) -> bool:
         try:
@@ -116,51 +116,29 @@ class PathFinder:
         if start in self._bfs_fully_computed:
             return
 
-        from env import is_valid_cell
+        from env import is_valid_cell, valid_next_pos
         if not is_valid_cell(start, self.grid):
             self._bfs_fully_computed.add(start)
             return
 
+        parent: Dict[Tuple[int, int], Tuple[Optional[Tuple[int, int]], str]] = {start: (None, "S")}
+        queue = deque([start])
+        queue_append = queue.append
+        queue_popleft = queue.popleft
+        moves_list = ("U", "D", "L", "R")
         dist_map = {start: 0}
-        parent = {start: (None, "S")}
-        frontier = [start]
-        visited = {start}
 
-        opp_move = ["D", "U", "R", "L"]
-        moves_offset = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        while queue:
+            cur = queue_popleft()
+            d_cur = dist_map[cur]
+            self._distance_cache[(start, cur)] = d_cur
 
-        d = 1
-        while frontier:
-            next_frontier = []
-            candidates = set()
-            for w in frontier:
-                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nr, nc = w[0] + dr, w[1] + dc
-                    nxt = (nr, nc)
-                    if 0 <= nr < self.N and 0 <= nc < self.N and self.grid[nr][nc] == 0:
-                        if nxt not in visited:
-                            candidates.add(nxt)
-
-            if not candidates:
-                break
-
-            frontier_set = set(frontier)
-            for v in sorted(candidates):
-                for c in range(4):
-                    dr, dc = moves_offset[c]
-                    w = (v[0] + dr, v[1] + dc)
-                    if w in frontier_set:
-                        parent[v] = (w, opp_move[c])
-                        dist_map[v] = d
-                        next_frontier.append(v)
-                        visited.add(v)
-                        break
-
-            frontier = next_frontier
-            d += 1
-
-        for node, dist in dist_map.items():
-            self._distance_cache[(start, node)] = dist
+            for mv in moves_list:
+                nxt = valid_next_pos(cur, mv, self.grid)
+                if nxt != cur and nxt not in parent:
+                    parent[nxt] = (cur, mv)
+                    dist_map[nxt] = d_cur + 1
+                    queue_append(nxt)
 
         self._parent_maps[start] = parent
         self._bfs_fully_computed.add(start)
