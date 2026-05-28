@@ -20,6 +20,7 @@ class OnlineSurgeHotspotDetector:
         
         self.is_surge = False
         self.predicted_hotspots: List[Tuple[int, int]] = []
+        self.hotspot_scores: Dict[Tuple[int, int], float] = {}
         
     def update(self, current_t: int, new_order_ids: List[int], all_orders: Dict[int, Order]):
         # 1. Ghi nhận số lượng đơn mới xuất hiện
@@ -62,8 +63,10 @@ class OnlineSurgeHotspotDetector:
                         if 0 <= r < self.N and 0 <= c < self.N and self.grid[r][c] == 0:
                             candidates[(r, c)] = candidates.get((r, c), 0) + count
             
+            self.hotspot_scores = candidates
             sorted_candidates = sorted(candidates.items(), key=lambda item: -item[1])
             n_hotspots = min(max(1, self.C // 2), 3)
             self.predicted_hotspots = [pos for pos, score in sorted_candidates[:n_hotspots]]
         else:
+            self.hotspot_scores = {}
             self.predicted_hotspots = []
