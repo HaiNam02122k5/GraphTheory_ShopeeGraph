@@ -6,6 +6,7 @@ from collections import deque
 from typing import Deque, Dict, List, Tuple, Set, Optional, Any
 
 from env import DeliveryEnv, Order, Shipper, is_valid_cell, valid_next_pos, delivery_reward
+from solvers.shared.detector import OnlineSurgeHotspotDetector
 
 Position = Tuple[int, int]
 Move = str
@@ -28,6 +29,90 @@ TAU_MAX = 8.0
 
 MOVES_CBS = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1), "S": (0, 0)}
 MOVE_TO_STR = {(-1, 0): "U", (1, 0): "D", (0, -1): "L", (0, 1): "R", (0, 0): "S"}
+
+try:
+    from scipy.optimize import linear_sum_assignment as scipy_linear_sum_assignment
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+
+def python_linear_sum_assignment(cost_matrix: List[List[float]]) -> Tuple[List[int], List[int]]:
+    n = len(cost_matrix)
+    if n == 0:
+        return [], []
+    m = len(cost_matrix[0])
+    transposed = False
+    if n > m:
+        cost_matrix = [list(x) for x in zip(*cost_matrix)]
+        n, m = m, n
+        transposed = True
+
+    u = [0.0] * (n + 1)
+    v = [0.0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [float("inf")] * (m + 1)
+        used = [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = float("inf")
+            j1 = 0
+            for j in range(1, m + 1):
+                if not used[j]:
+                    cur = cost_matrix[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    res = [-1] * n
+    for j in range(1, m + 1):
+        if p[j] != 0:
+            res[p[j] - 1] = j - 1
+
+    row_ind = list(range(n))
+    col_ind = res
+    if transposed:
+        orig_row = [-1] * m
+        for r, c in zip(row_ind, col_ind):
+            if c != -1:
+                orig_row[c] = r
+        matched_rows = []
+        matched_cols = []
+        for c in range(m):
+            if orig_row[c] != -1:
+                matched_rows.append(c)
+                matched_cols.append(orig_row[c])
+        return matched_rows, matched_cols
+    return row_ind, col_ind
+
+
+def linear_sum_assignment(cost_matrix: List[List[float]]):
+    if HAS_SCIPY:
+        return scipy_linear_sum_assignment(cost_matrix)
+    return python_linear_sum_assignment(cost_matrix)
 
 
 class Solver:
@@ -692,8 +777,15 @@ class MAPDCBSSolver(ACOSolver):
             "cbs_failed": 0,
             "group_cbs_calls": 0,
             "local_steps": 0,
+            "surge_steps": 0,
+            "hotspot_assignments": 0,
         }
         self._order_delivery_dist: Dict[int, int] = {}
+        self.detector = OnlineSurgeHotspotDetector(
+            env.N, env.C, env.G, env.T, self.grid
+        )
+        self._seen_order_ids: Set[int] = set()
+        self._shipper_hotspot_assignments: Dict[int, Position] = {}
         if self.env.N <= 22:
             self.max_delivery_delay = 10
         elif self.env.N <= 25:
@@ -1268,6 +1360,105 @@ class MAPDCBSSolver(ACOSolver):
         eta = obs["t"] + d_pick + d_drop + 2
         return eta - order.et <= self.max_delivery_delay
 
+    def _update_surge_hotspot_detector(self, obs: dict) -> None:
+        orders: Dict[int, Order] = obs["orders"]
+        current_t = obs.get("t", 0)
+        current_order_ids = set(orders.keys())
+        new_order_ids = list(current_order_ids - self._seen_order_ids)
+        self._seen_order_ids.update(current_order_ids)
+        self.detector.update(current_t, new_order_ids, orders)
+        if self.detector.is_surge:
+            self._stats["surge_steps"] += 1
+
+    def _hotspot_slots(self, n_idle: int) -> List[Position]:
+        hotspots = list(self.detector.predicted_hotspots)
+        if n_idle <= 0 or not hotspots:
+            return []
+
+        if self.env.N < 100:
+            scores = [self.detector.hotspot_scores.get(hp, 1.0) for hp in hotspots]
+            total_score = sum(scores) if sum(scores) > 0.0 else 1.0
+            slots: List[Position] = []
+            for hp, score in zip(hotspots, scores):
+                alloc = max(1, int(round(n_idle * (score / total_score))))
+                slots.extend([hp] * alloc)
+        else:
+            max_per_hotspot = max(1, n_idle // len(hotspots))
+            slots = []
+            for hp in hotspots:
+                slots.extend([hp] * max_per_hotspot)
+
+        while len(slots) < n_idle:
+            best_hp = max(
+                hotspots,
+                key=lambda hp: self.detector.hotspot_scores.get(hp, 0.0),
+            )
+            slots.append(best_hp)
+
+        while len(slots) > n_idle:
+            hp_counts = {hp: slots.count(hp) for hp in hotspots}
+            removable = [hp for hp, count in hp_counts.items() if count > 1]
+            if removable:
+                worst_hp = min(
+                    removable,
+                    key=lambda hp: self.detector.hotspot_scores.get(hp, 0.0),
+                )
+                slots.remove(worst_hp)
+            else:
+                slots.pop()
+
+        return slots
+
+    def _assign_hotspot_targets(self, obs: dict) -> None:
+        self._shipper_hotspot_assignments = {}
+        if not self.detector.is_surge or not self.detector.predicted_hotspots:
+            return
+
+        idle_shippers = [
+            s for s in obs["shippers"]
+            if len(s.bag) == 0 and not self._targets.get(s.id)
+        ]
+        if not idle_shippers:
+            return
+
+        hotspot_slots = self._hotspot_slots(len(idle_shippers))
+        if not hotspot_slots:
+            return
+
+        cost_matrix = [
+            [self._dist(s.position, hp) for hp in hotspot_slots]
+            for s in idle_shippers
+        ]
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        for row, col in zip(row_ind, col_ind):
+            row_i, col_i = int(row), int(col)
+            if row_i < 0 or col_i < 0:
+                continue
+            if row_i >= len(idle_shippers) or col_i >= len(hotspot_slots):
+                continue
+            if cost_matrix[row_i][col_i] >= INF:
+                continue
+            shipper = idle_shippers[row_i]
+            self._shipper_hotspot_assignments[shipper.id] = hotspot_slots[col_i]
+
+        self._stats["hotspot_assignments"] += len(self._shipper_hotspot_assignments)
+
+    def _hotspot_goal_for(self, shipper: Shipper) -> Optional[Position]:
+        if not self.detector.is_surge or not self.detector.predicted_hotspots:
+            return None
+
+        hotspot = self._shipper_hotspot_assignments.get(shipper.id)
+        if hotspot is None:
+            hotspot = min(
+                self.detector.predicted_hotspots,
+                key=lambda hp: self._dist(shipper.position, hp),
+            )
+        if hotspot == shipper.position:
+            return None
+        if self._dist(shipper.position, hotspot) >= INF:
+            return None
+        return hotspot
+
     def _get_shipper_goal(self, shipper: Shipper, obs: dict) -> Tuple[Position, int]:
         orders: Dict[int, Order] = obs["orders"]
         queue = self._targets.get(shipper.id)
@@ -1312,6 +1503,10 @@ class MAPDCBSSolver(ACOSolver):
             self._targets[shipper.id].append(((pickup_order.ex, pickup_order.ey), 2, pickup_order.id))
             stop = self._targets[shipper.id][0]
             return stop[0], stop[1]
+
+        hotspot_goal = self._hotspot_goal_for(shipper)
+        if hotspot_goal is not None:
+            return hotspot_goal, 0
 
         return shipper.position, 0
 
@@ -1933,11 +2128,18 @@ class MAPDCBSSolver(ACOSolver):
         self._targets = {s.id: deque() for s in obs["shippers"]}
         self._reserved = set()
         self._last_plan_t = -self._replan_interval
+        self._seen_order_ids = set()
+        self.detector = OnlineSurgeHotspotDetector(
+            self.env.N, len(obs["shippers"]), obs["G"], self.env.T, self.grid
+        )
+        self._shipper_hotspot_assignments = {}
 
         while not obs.get("done", False):
+            self._update_surge_hotspot_detector(obs)
             if self._should_replan(obs):
                 self._replan(obs)
 
+            self._assign_hotspot_targets(obs)
             self._reserved = set()
             goals: Dict[int, Position] = {}
             ops: Dict[int, int] = {}
