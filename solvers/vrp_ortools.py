@@ -1732,6 +1732,18 @@ class VRPOrToolsSolver(Solver):
         if time_since_last >= self._replan_interval:
             return True
 
+        # Nếu có đơn hàng mới, cho phép re-plan ngay lập tức để không bỏ lỡ đơn
+        if obs.get("new_order_ids"):
+            return True
+
+        # Tránh re-plan quá dày đặc bằng cách áp đặt cooldown tối thiểu trước các điều kiện rảnh tay
+        if self.env.N >= 50:
+            min_cooldown = 2 if self.env.N > 50 else 1
+        else:
+            min_cooldown = min(5, self._replan_interval)
+        if time_since_last < min_cooldown:
+            return False
+
         shippers = obs["shippers"]
         orders = obs["orders"]
 
@@ -1748,18 +1760,6 @@ class VRPOrToolsSolver(Solver):
         )
 
         if has_idle_shipper and has_unassigned:
-            return True
-
-        # DO NOT MODIFY: Cooldown to avoid thrashing on small/medium maps (N < 50), while responding quickly on large maps (N >= 50)
-        # Giữ nguyên để tránh shipper quay đầu liên tục (thrashing) tại các bottleneck của map nhỏ/trung bình
-        if self.env.N >= 50:
-            min_cooldown = 2 if self.env.N > 50 else 1
-        else:
-            min_cooldown = min(5, self._replan_interval)
-        if time_since_last < min_cooldown:
-            return False
-
-        if obs.get("new_order_ids") and has_unassigned:
             return True
 
         if has_unassigned:
