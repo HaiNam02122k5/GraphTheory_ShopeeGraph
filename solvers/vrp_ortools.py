@@ -492,15 +492,26 @@ class VRPOrToolsSolver(Solver):
         self._assignment: Dict[int, int] = {}   # order_id → shipper_id
 
         self._last_plan_t: int = -99
-        self._replan_interval = (
+        self._base_replan_interval = (
             REPLAN_INTERVAL_LARGE if env.N >= 18 else REPLAN_INTERVAL_SMALL
         )
+        self._replan_interval = self._base_replan_interval
         self.max_active_orders = (
             MAX_ACTIVE_ORDERS_LARGE if env.N > 50 else MAX_ACTIVE_ORDERS_SMALL
         )
         self._prev_pending_count: int = 0
         self.large_map_late_coef = 0.4
         self.numba_late_coef = 0.2
+
+        # --- Adaptive replan: CPU benchmark & dynamic budget ---
+        self._cpu_speed_ratio = self._benchmark_cpu()
+        # Budget: chỉ giới hạn khi CPU chậm (ratio < 0.7). CPU nhanh → budget rất rộng
+        if self._cpu_speed_ratio >= 0.7:
+            self._replan_time_budget = 999.0  # không giới hạn
+        else:
+            self._replan_time_budget = max(0.5, 0.3 / self._cpu_speed_ratio)
+        self._last_replan_duration = 0.0
+        self._replan_durations = []  # rolling window
 
         from env import is_valid_cell, valid_next_pos
         adj = {}
@@ -554,45 +565,17 @@ class VRPOrToolsSolver(Solver):
         avg_dist = total_dist / pair_count if pair_count > 0 else 10.0
         self.avg_dist = avg_dist
 
-        # Define grid-specific late coefficients
-        import hashlib
-        grid_str = str(self.env.grid).encode('utf-8')
-        grid_hash = hashlib.md5(grid_str).hexdigest()
-        
-        # Grid hash mappings to optimized late coefficients
-        hash_coefficients = {
-            '04255446f946cf6c13c42ea6279a8f6a': (0.428, 0.221), # MAX1 -> 4223.69
-            '9733c1dcaf227c8a766cbfffaa58bed1': (0.6, 0.3),    # MAX2 -> 2922.95
-            '1c2f0fb645d2e79843626dff92ff4bf1': (0.4, 0.2),    # MAX3 -> 3887.78
-            '77ca8dfd5b465b9faec042a4b81437e7': (0.6, 0.3),    # MAX4 -> 2611.38
-            'e66e3f43820d1f19adab532f875384fb': (0.4, 0.2),    # MAX5 -> 4152.41
-            '226a3660f52ac92bb7acf616f145280e': (0.4, 0.2),    # MAX6 -> 4284.27
-            '74c5738730d47cd491755b530bba4afb': (0.4, 0.2),    # MAX7 -> 3581.18
-            '4945a5bc7654ee967b63b51b8c1a973d': (0.4, 0.2),    # MAX8 -> 4333.75
-        }
-        
-        if grid_hash in hash_coefficients:
-            self.large_map_late_coef, self.numba_late_coef = hash_coefficients[grid_hash]
+        # Dynamically scale late coefficients based on avg_dist
+        if avg_dist <= 90.0:
+            self.large_map_late_coef = 0.4
+            self.numba_late_coef = 0.2
+        elif avg_dist >= 115.0:
+            self.large_map_late_coef = 0.8
+            self.numba_late_coef = 0.5
         else:
-            if avg_dist <= 90.0:
-                self.large_map_late_coef = 0.4
-                self.numba_late_coef = 0.2
-            elif avg_dist >= 115.0:
-                self.large_map_late_coef = 0.8
-                self.numba_late_coef = 0.5
-            else:
-                t = (avg_dist - 90.0) / 25.0
-                self.large_map_late_coef = 0.4 + t * 0.4
-                self.numba_late_coef = 0.2 + t * 0.3
-
-
-        import os
-        if "LATE_COEF" in os.environ:
-            self.large_map_late_coef = float(os.environ["LATE_COEF"])
-        if "NUMBA_COEF" in os.environ:
-            self.numba_late_coef = float(os.environ["NUMBA_COEF"])
-        if "MAX_ACTIVE" in os.environ:
-            self.max_active_orders = int(os.environ["MAX_ACTIVE"])
+            t = (avg_dist - 90.0) / 25.0
+            self.large_map_late_coef = 0.4 + t * 0.4
+            self.numba_late_coef = 0.2 + t * 0.3
 
 
         def interpolate(x, x_pts, y_pts):
@@ -620,6 +603,19 @@ class VRPOrToolsSolver(Solver):
             y_opp = [15, 25, 10, 30, 20, 15]
             self.max_delivery_delay = max(5, int(round(interpolate(avg_dist, x_pts, y_delay))))
             self.max_opp_dist = max(10, int(round(interpolate(avg_dist, x_pts, y_opp))))
+
+    def _benchmark_cpu(self) -> float:
+        """Quick CPU benchmark. Returns speed ratio vs reference (1.0 = fast desktop)."""
+        import time as _time
+        t0 = _time.perf_counter()
+        s = 0
+        for i in range(500_000):
+            s += i
+        elapsed = _time.perf_counter() - t0
+        # Reference: fast desktop ~0.025s for 500K loop
+        ref_time = 0.025
+        ratio = ref_time / max(elapsed, 0.001)
+        return min(ratio, 2.0)  # cap at 2x
 
 
     # -----------------------------------------------------------------------
@@ -1378,7 +1374,12 @@ class VRPOrToolsSolver(Solver):
         assigned_map: Dict[int, List[Order]] = {s.id: [] for s in shippers}
 
         max_rounds = max(get_capacity_limit(s) for s in shippers)
+        replan_t0 = time.perf_counter()
         for round_idx in range(max_rounds):
+            # Time budget: early exit nếu quá chậm
+            if time.perf_counter() - replan_t0 > self._replan_time_budget:
+                break
+
             already_assigned_ids = {o.id for orders_list in assigned_map.values() for o in orders_list}
             unassigned_active = [o for o in unpicked if o.id not in already_assigned_ids]
             if not unassigned_active:
@@ -1770,7 +1771,25 @@ class VRPOrToolsSolver(Solver):
 
     def _replan(self, obs: dict) -> None:
         self._last_plan_t = obs["t"]
+        t0 = time.perf_counter()
         routes = self._run_vrp_exact(obs)
+        self._last_replan_duration = time.perf_counter() - t0
+        self._replan_durations.append(self._last_replan_duration)
+        if len(self._replan_durations) > 10:
+            self._replan_durations.pop(0)
+
+        # Adaptive interval: chỉ tăng interval khi CPU chậm VÀ replan tốn nhiều thời gian
+        avg_dur = sum(self._replan_durations) / len(self._replan_durations)
+        if self._cpu_speed_ratio < 0.7:
+            if avg_dur > 0.5:
+                self._replan_interval = min(self._base_replan_interval * 3, 15)
+            elif avg_dur > 0.2:
+                self._replan_interval = min(self._base_replan_interval * 2, 10)
+            else:
+                self._replan_interval = self._base_replan_interval
+        else:
+            self._replan_interval = self._base_replan_interval
+
         if routes is not None:
             new_targets = self._extract_targets(routes, obs)
             for s_id, tgts in new_targets.items():
