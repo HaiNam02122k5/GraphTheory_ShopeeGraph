@@ -321,7 +321,7 @@ Cơ chế này đảm bảo shipper không bao giờ đứng yên lãng phí tro
 \footnotesize
 \begin{tabular}{|c|r|c|c|c|c|r|}
 \hline
-\textbf{Config} & \textbf{Net reward} & \textbf{Giao} & \textbf{Đúng hạn} & \textbf{Trễ} & \textbf{Bỏ lỡ} & \textbf{Time} \\
+\textbf{Config} & \textbf{Reward} & \textbf{Giao} & \textbf{Đúng hạn} & \textbf{Trễ} & \textbf{Bỏ lỡ} & \textbf{Time} \\
 \hline
 C1 & 266.94 & 13/15 & 100.0\% & 0 & 2 & 1.32s \\
 C2 & 474.25 & 24/25 &  95.8\% & 1 & 1 & 0.05s \\
@@ -464,7 +464,7 @@ Với bản đồ cực lớn ($N \ge 100$), phân phối tuyệt đối đều 
 \footnotesize
 \begin{tabular}{|c|r|c|c|c|c|r|}
 \hline
-\textbf{Config} & \textbf{Net reward} & \textbf{Giao} & \textbf{Đúng hạn} & \textbf{Trễ} & \textbf{Bỏ lỡ} & \textbf{Time} \\
+\textbf{Config} & \textbf{Reward} & \textbf{Giao} & \textbf{Đúng hạn} & \textbf{Trễ} & \textbf{Bỏ lỡ} & \textbf{Time} \\
 \hline
 C1 & 267.46  & 13/15  & 100.0\% & 0  & 2 & 1.32s \\
 C2 & 488.72  & 24/25  & 100.0\% & 0  & 1 & 0.06s \\
@@ -619,6 +619,30 @@ ACO nguyên thủy có thể dùng kiến để tìm cả đường đi trên l�
 Sau mỗi bước, nếu shipper tiến gần mục tiêu hơn, pheromone chuyển động \texttt{tau\_move} theo vùng và hướng đi được tăng nhẹ; nếu đi kém hoặc bị kẹt nhiều lần, thuật toán tăng \texttt{congestion} cho vùng hiện tại. Tầng này không đảm bảo tránh mọi va chạm như CBS, nhưng đủ nhẹ để xử lý các xung đột trực tiếp trong thời gian thực.
 
 \subsection{Kết quả}
+Bảng~\ref{tab:aco-phase1} trình bày kết quả ACO trên bộ \texttt{test\_config.txt} Phase~1.
+
+\begin{table}[htbp]
+\caption{Kết quả ACO trên bộ \texttt{test\_config.txt}}
+\label{tab:aco-phase1}
+\centering
+\footnotesize
+\begin{tabular}{|c|r|c|c|c|c|r|}
+\hline
+\textbf{Config} & \textbf{Reward} & \textbf{Giao} & \textbf{Đúng hạn} & \textbf{Trễ} & \textbf{Bỏ lỡ} & \textbf{Time} \\
+\hline
+C1 &  267.90  & 13/15  & 100.0\% & 0 & 2 & 0.14s \\
+C2 &  493.23  & 24/25  & 100.0\% & 0 & 1 & 0.03s \\
+C3 &  949.96  & 37/40  & 100.0\% & 0 & 3 & 0.07s \\
+C4 & 1079.86  & 56/60  &  96.4\% & 2 & 4 & 0.24s \\
+C5 & 1461.62  & 76/80  &  89.5\% & 8 & 4 & 0.40s \\
+C6 & 1679.48  & 91/100 &  91.2\% & 8 & 9 & 1.12s \\
+\hline
+\textbf{Tổng} & \textbf{5932.04} & \textbf{297/320} & \textbf{93.3\%} & \textbf{18} & \textbf{23} & \textbf{2.00s} \\
+\hline
+\end{tabular}
+\end{table}
+
+ACO đạt tổng Net Reward 5932.04, xếp thứ hai toàn bảng, chỉ sau MAPD-CBS. Đặc biệt, ACO có tỷ lệ đúng hạn trên tổng đơn giao được cao nhất trong bốn thuật toán (93.3\%): ba cấu hình nhỏ C1--C3 đều đạt 100\% đúng hạn và hoàn toàn không có đơn trễ. Kết quả này phản ánh hiệu quả của cơ chế pheromone và pressure map trong việc ưu tiên đơn sắp hết hạn, tránh nhận đơn xa khi không đủ thời lượng giao đúng hạn.
 
 
 \subsection{Đánh giá độ phức tạp}
@@ -669,6 +693,7 @@ ACO trong project là thuật toán \textbf{meta-heuristic theo online learning}
 ACO là phương án trung gian giữa Greedy BFS và các bộ giải lập kế hoạch nặng hơn. Thuật toán vẫn giữ được tốc độ phản ứng cao, nhưng bổ sung khả năng học từ các giao hàng thành công và nhận biết áp lực đơn hàng online. Điểm mạnh của ACO nằm ở các cấu hình có pattern đơn hàng lặp lại hoặc hotspot rõ ràng; điểm yếu là không xử lý phối hợp không gian sâu bằng CBS và không tối ưu assignment toàn cục chặt chẽ như VRP/Hungarian.
 
 
+
 % ---------------------------------------------
 % MAPD-CBS
 % ---------------------------------------------
@@ -676,7 +701,7 @@ ACO là phương án trung gian giữa Greedy BFS và các bộ giải lập k�
 \subsection{Giới thiệu thuật toán}
 MAPD-CBS là hướng tiếp cận kết hợp giữa bài toán \textit{Multi-Agent Pickup and Delivery} (MAPD) và \textit{Conflict-Based Search} (CBS). Trong MAPD, mỗi shipper không chỉ cần đi tới một đích cố định, mà còn phải liên tục nhận và giao nhiều đơn hàng xuất hiện online theo thời gian \cite{ma2017lifelong}. Trong khi đó, CBS nguyên thủy được thiết kế cho bài toán MAPF với tập tác tử và mục tiêu đã biết trước: tầng cao duy trì cây ràng buộc (Constraint Tree), còn tầng thấp tìm lại đường đi cho từng tác tử khi phát hiện xung đột đỉnh hoặc xung đột cạnh \cite{sharon2015cbs}.
 
-Nếu áp dụng CBS nguyên thủy trực tiếp cho bài toán giao hàng của đề bài, thuật toán gặp ba nút thắt lớn. Thứ nhất, đơn hàng xuất hiện động nên mục tiêu của shipper thay đổi liên tục, khiến việc tìm một kế hoạch toàn cục từ $t=0$ đến $T$ không thực tế. Thứ hai, số lượng shipper và đơn hàng lớn làm cây ràng buộc của CBS tăng theo hàm mũ khi có nhiều xung đột trong hotspot. Thứ ba, tối ưu đường đi không đủ để tối đa hóa điểm, vì hệ thống còn phải xét deadline, tải trọng, số lượng đơn trong túi và phần thưởng ưu tiên. Do đó, trong project này MAPD-CBS được triển khai như một kiến trúc hai tầng: tầng trên phân công nhiệm vụ bằng rolling-horizon ACO/heuristic, tầng dưới dùng windowed CBS để làm mượt chuyển động và giảm va chạm trong một cửa sổ thời gian ngắn.
+Nếu áp dụng CBS nguyên thủy trực tiếp cho bài toán giao hàng của đề bài, thuật toán gặp ba nút thắt lớn. Thứ nhất, đơn hàng xuất hiện động nên mục tiêu của shipper thay đổi liên tục, khiến việc tìm một kế hoạch toàn cục từ $t=0$ đến $T$ không thực tế. Thứ hai, số lượng shipper và đơn hàng lớn làm cây ràng buộc của CBS tăng theo hàm mũ khi có nhiều xung đột trong hotspot. Thứ ba, tối ưu đường đi không đủ để tối đa hóa điểm, vì hệ thống còn phải xét deadline, tải trọng, số lượng đơn trong túi và phần thưởng ưu tiên. Do đó, trong project này MAPD-CBS được triển khai như một kiến trúc ba tầng: tầng thứ nhất dự báo và định vị lại shipper chủ động (Surge/Hotspot detection và Hungarian Repositioning); tầng thứ hai phân công nhiệm vụ và lập lộ trình bằng rolling-horizon ACO/heuristic; tầng thứ ba điều phối di chuyển tránh va chạm sử dụng windowed CBS kết hợp bộ giải quyết bế tắc (deadlock) cục bộ.
 
 \subsection{Triết lý thuật toán}
 \begin{center}
@@ -690,10 +715,15 @@ Tại mỗi bước thời gian $t$, thuật toán thực hiện chu trình sau:
 
 \begin{enumerate}
     \item \textbf{Quan sát trạng thái hiện tại:} Lấy danh sách đơn hàng đã xuất hiện, vị trí shipper, túi hàng hiện tại, deadline và các giới hạn $W_{max}, K_{max}$.
-    \item \textbf{Tái lập lịch khi cần:} Nếu đã hết khoảng \texttt{replan\_interval}, hoặc có đủ đơn mới xuất hiện, tầng ACO xây dựng lại hàng đợi mục tiêu cho từng shipper. Mỗi mục tiêu có dạng $(pos, op, id)$, trong đó $op=1$ là nhặt hàng và $op=2$ là giao hàng.
-    \item \textbf{Chọn mục tiêu gần hạn:} Với shipper đang mang hàng, thuật toán ưu tiên đơn có deadline gấp và còn khả năng đem lại reward. Với shipper rỗng, hệ thống chọn pickup khả thi dựa trên điểm kỳ vọng, đồng thời dùng tập \texttt{reserved} để tránh nhiều shipper cùng nhận một đơn.
-    \item \textbf{Tìm đường không xung đột:} Từ vị trí hiện tại và mục tiêu ngắn hạn của các shipper, tầng CBS tìm đường trong cửa sổ $W$ bước. Nếu dùng chế độ \texttt{full}, CBS chạy trên toàn bộ shipper. Nếu dùng chế độ \texttt{group}, thuật toán chỉ chạy CBS trên các nhóm đang có nguy cơ xung đột.
-    \item \textbf{Xuất một bước hành động:} Từ đường đi CBS, solver chỉ lấy bước đầu tiên làm action cho môi trường. Sau đó lớp xử lý deadlock cục bộ tiếp tục kiểm tra va chạm cùng ô, đổi chỗ cạnh và tình huống shipper rảnh chặn đường shipper có hàng.
+    \item \textbf{Cập nhật bộ phát hiện Surge/Hotspot trực tuyến:} Xác định các đơn mới phát sinh và cập nhật lịch sử vị trí lấy hàng vào \texttt{OnlineSurgeHotspotDetector}.
+    \item \textbf{Tái lập lịch nhiệm vụ vĩ mô:} Nếu đã hết khoảng \texttt{replan\_interval}, hoặc có đủ đơn mới xuất hiện, tầng ACO xây dựng lại hàng đợi mục tiêu cho từng shipper. Mỗi mục tiêu có dạng $(pos, op, id)$, trong đó $op=1$ là nhặt hàng và $op=2$ là giao hàng.
+    \item \textbf{Chọn mục tiêu ngắn hạn:} 
+        \begin{itemize}
+            \item Với shipper đang mang hàng: Ưu tiên di chuyển về điểm giao của đơn có deadline gấp và còn khả năng đem lại phần thưởng tích lũy.
+            \item Với shipper rỗng: Lập kế hoạch nhặt nhiều đơn (multi-pickup) hoặc đơn đơn lẻ từ các đơn hàng chưa gán trong tập \texttt{available\_orders} (áp dụng cơ chế \texttt{reserved} tránh tranh chấp). Nếu không có đơn khả thi và hệ thống đang kích hoạt trạng thái Surge, shipper rỗng được phân công di chuyển về Hotspot dự báo tương ứng thông qua giải thuật Hungarian. Nếu không có Surge, shipper đứng yên tại chỗ (\texttt{S}) để tiết kiệm chi phí di chuyển.
+        \end{itemize}
+    \item \textbf{Tìm đường không xung đột:} Từ vị trí hiện tại và mục tiêu ngắn hạn của các shipper, tầng CBS tìm đường đi tối ưu không va chạm trong cửa sổ thời gian ngắn $W$ bước.
+    \item \textbf{Xuất hành động và xử lý deadlock cục bộ:} Trích xuất bước đi đầu tiên từ kế hoạch CBS làm hành động gửi về môi trường. Sau đó, chạy bộ lọc deadlock cục bộ để sửa lỗi va chạm cùng ô, hoán đổi cạnh hoặc tránh đường cho các shipper ưu tiên cao hơn.
 \end{enumerate}
 
 Trong tầng CBS, mỗi đường đi được biểu diễn dưới dạng:
@@ -724,8 +754,21 @@ Trong đó $R$ là hàm thưởng giao hàng, $e_o$ là deadline, $p_o$ là mứ
 \subsubsection{Windowed CBS thay cho CBS toàn horizon}
 CBS tối ưu nguyên thủy có chi phí lớn vì phải lập kế hoạch tới tận đích cuối. Trong project, tầng CBS chỉ chạy trên cửa sổ ngắn $W$ bước, mặc định $W=12$ ở cấu hình nhỏ và giảm còn $6$ hoặc $8$ ở cấu hình lớn. Điều này phù hợp với môi trường online: sau mỗi vài bước, đơn mới có thể xuất hiện và kế hoạch cũ cần được cập nhật. Windowed CBS không đảm bảo tối ưu toàn cục, nhưng xử lý đúng phần quan trọng nhất là các va chạm sắp xảy ra.
 
-\subsubsection{Group CBS theo cụm xung đột}
-Với bản đồ lớn hoặc số shipper nhiều, chạy CBS trên toàn bộ $C$ shipper ở mỗi bước sẽ không khả thi. Solver vì vậy dự đoán trước action độc lập của từng shipper, phát hiện các cặp có nguy cơ cùng ô, đổi chỗ hoặc chắn nhau, rồi gom chúng thành các nhóm xung đột bằng cấu trúc union-find. CBS chỉ chạy trên nhóm có kích thước không vượt quá \texttt{group\_cbs\_max\_size}. Nhờ vậy, độ khó của CBS phụ thuộc vào số shipper đang thật sự tranh chấp không gian, thay vì phụ thuộc vào toàn bộ đội shipper.
+\subsubsection{Tích hợp bộ phát hiện Surge và Hotspot trực tuyến}
+Tương tự như trong Greedy BFS, MAPD-CBS sử dụng bộ phát hiện \texttt{OnlineSurgeHotspotDetector} để nắm bắt biến động đơn hàng mà không vi phạm nguyên tắc truy cập cấu hình môi trường. Tại mỗi bước $t$, solver theo dõi số lượng đơn hàng mới phát sinh để tính toán tốc độ sinh đơn hiện thời $\hat{\lambda}_t$ (trong cửa sổ 20 bước) và so sánh với tốc độ sinh đơn nền $\lambda_0 = G/T$. Trạng thái Surge được xác nhận khi tốc độ sinh đơn tăng đột biến vượt ngưỡng $2.2 \cdot \lambda_0$. Đồng thời, vị trí các đơn hàng mới trong cửa sổ lịch sử 100 bước được sử dụng để tích lũy điểm mật độ theo bán kính Manhattan $\le 3$. Các ô trống có điểm cao nhất được chọn làm $n_h = \min(\max(1, \lfloor C/2 \rfloor), 3)$ vùng Hotspot dự báo.
+
+\subsubsection{Định vị lại chủ động (Repositioning) bằng giải thuật Hungarian}
+Để giải quyết bài toán điều hướng shipper rảnh đón đầu nhu cầu đơn hàng tăng vọt tại các điểm nóng trong thời kỳ Surge, MAPD-CBS triển khai chiến lược định vị lại tối ưu:
+\begin{itemize}
+    \item \textbf{Phân bổ slot (Hotspot Slots):} Xác định số lượng shipper rảnh ($n_{idle}$). Với bản đồ nhỏ ($N < 100$), số slot tại các hotspot được tạo ra tỉ lệ thuận với điểm số hotspot. Với bản đồ lớn ($N \ge 100$), số slot được chia đều để tránh gom quá đông shipper vào một chỗ gây tắc nghẽn cục bộ trên các hành lang hẹp.
+    \item \textbf{Ghép cặp tối ưu (Hungarian Assignment):} Xây dựng ma trận chi phí kích thước $n_{idle} \times n_{idle}$ (bằng cách nhân bản các slot hotspot cho khớp số lượng shipper), với chi phí là khoảng cách di chuyển thực tế từ \texttt{PathFinder}. Bài toán matching hai phía được giải quyết để tìm ra phương án gán shipper-hotspot tối ưu tổng khoảng cách di chuyển.
+    \item \textbf{Cơ chế fallback robust không phụ thuộc thư viện:} Để đảm bảo chương trình chạy thành công trên mọi môi trường chấm điểm Kaggle, solver cài đặt sẵn hàm Hungarian thuần Python (\texttt{python\_linear\_sum\_assignment}). Hệ thống sẽ tự động gọi \texttt{scipy.optimize.linear\_sum\_assignment} khi import được SciPy, và tự động chuyển đổi sang bộ giải thuần Python nội bộ nếu SciPy không khả dụng.
+\end{itemize}
+
+\subsubsection{Group CBS theo cụm xung đột và lọc cụm nghiêm trọng}
+Với bản đồ lớn hoặc số lượng shipper nhiều, việc chạy CBS trên toàn bộ $C$ shipper ở mỗi bước là bất khả thi. Solver do đó dự đoán trước action độc lập tạm thời của từng shipper, phát hiện các nguy cơ va chạm cùng ô hoặc đổi chỗ qua cạnh, và gom chúng thành các nhóm xung đột độc lập bằng cấu trúc dữ liệu Union-Find. CBS chỉ chạy độc lập trên các nhóm có kích thước không vượt quá \texttt{group\_cbs\_max\_size} (mặc định bằng $6$).
+
+Đặc biệt, ở cấu hình lớn ($G \ge 1000$ hoặc $C \ge 20$), solver bổ sung cơ chế lọc \texttt{\_is\_serious\_conflict\_group}. Nếu một nhóm xung đột được gom lại nhưng không chứa bất kỳ shipper nào đang mang hàng (\texttt{bag} trống) hoặc đang thực hiện thao tác nhận/giao đơn thực sự (operation $1$ hoặc $2$), solver sẽ bỏ qua lượt chạy CBS đắt đỏ cho nhóm này. Các shipper trong cụm không nghiêm trọng sẽ thực hiện hành động độc lập và tự tránh va chạm bằng bộ sửa deadlock cục bộ. Sự cải tiến này giúp kiểm soát chặt chẽ ngân sách thời gian thực thi của CBS, tránh TLE hiệu quả trên các cấu hình cực lớn.
 
 \subsubsection{Ràng buộc deadline và ngân sách thời gian}
 Ở cấu hình lớn, thuật toán bật \texttt{strict\_deadline\_mode} để loại bỏ các đơn có thời gian giao ước lượng vượt deadline quá xa. Các tham số \texttt{window\_size}, \texttt{cbs\_max\_nodes}, \texttt{cbs\_time\_limit}, số vòng ACO và số đơn active đều được điều chỉnh theo $N, C, G$. Ví dụ, khi $G \ge 1000$ hoặc $C \ge 20$, solver giảm cửa sổ CBS xuống $6$, giới hạn số node CBS còn $10$ và chuyển sang chế độ group. Đây là đánh đổi cần thiết để giữ chương trình chạy trong giới hạn 60 phút trên Kaggle.
@@ -743,21 +786,25 @@ Khi CBS hết thời gian hoặc không tìm được lời giải trong ngân s
 \hline
 \textbf{Config} & \textbf{Net reward} & \textbf{Giao} & \textbf{Đúng hạn} & \textbf{Time} \\
 \hline
-C1 & 265.93 & 13/15 & 100.0\% & 0.75s \\
+C1 & 265.95 & 13/15 & 100.0\% & 0.85s \\
 C2 & 456.17 & 24/25 & 87.5\% & 0.51s \\
-C3 & 911.54 & 37/40 & 97.3\% & 1.62s \\
-C4 & 1065.64 & 56/60 & 94.6\% & 4.78s \\
-C5 & 1391.89 & 75/80 & 82.7\% & 6.95s \\
-C6 & 1729.54 & 91/100 & 90.1\% & 5.14s \\
+C3 & 899.72 & 37/40 & 94.6\% & 1.68s \\
+C4 & 1065.64 & 56/60 & 94.6\% & 4.55s \\
+C5 & 1417.64 & 76/80 & 84.2\% & 5.73s \\
+C6 & 1742.48 & 91/100 & 92.3\% & 4.75s \\
 \hline
-\textbf{Tổng} & \textbf{5820.70} & \textbf{296/320} & \textbf{90.2\%} & \textbf{19.75s} \\
+\textbf{Tổng} & \textbf{5847.60} & \textbf{297/320} & \textbf{90.9\%} & \textbf{18.06s} \\
 \hline
 \end{tabular}
 \end{table}
 
-Kết quả ở Bảng \ref{tab:mapd-cbs-phase1} cho thấy MAPD-CBS đạt tỷ lệ giao hàng tổng thể $92.5\%$ trên 6 cấu hình Phase 1, với tổng thời gian chạy dưới 20 giây khi chỉ chạy riêng phương pháp này. Tỷ lệ đúng hạn giảm ở C5 do bản đồ lớn hơn, số đơn cao hơn và nhiều đơn bị gom vào các lộ trình dài, nhưng thuật toán vẫn giữ được delivery rate trên $90\%$ ở tất cả cấu hình từ C2 đến C6.
+Kết quả ở Bảng \ref{tab:mapd-cbs-phase1} cho thấy MAPD-CBS đạt tổng Net Reward là \textbf{5847.60}. Tỷ lệ giao hàng tổng thể đạt $92.8\%$ (297/320 đơn), với tổng thời gian chạy là 18.06 giây cho cả 6 cấu hình. Tỷ lệ đúng hạn tổng thể đạt $90.9\%$ ($270/297$ đơn), trong đó thuật toán hoạt động ổn định và đạt kết quả cao trên toàn bộ các cấu hình từ nhỏ đến lớn.
 
-Thống kê nội bộ cho thấy trong 6 cấu hình, CBS được gọi 3180 lần và tìm được đường không xung đột trong 2698 lần. Các lần còn lại được xử lý bằng action độc lập và bộ sửa deadlock, cho thấy thiết kế fallback là cần thiết: nếu bắt CBS luôn phải thành công, thuật toán sẽ dễ bị quá thời gian ở các thời điểm mật độ shipper cao.
+Thống kê nội bộ từ các cấu hình cho thấy:
+\begin{itemize}
+    \item \textbf{Tần suất CBS:} CBS được gọi tổng cộng 3180 lần, trong đó tìm được đường đi hoàn toàn không xung đột thành công 2717 lần (tỷ lệ thành công $85.4\%$). Các lần thất bại (463 lần) do hết node hoặc hết time budget được xử lý an toàn bằng fallback di chuyển độc lập kết hợp bộ giải quyết deadlock cục bộ.
+    \item \textbf{Hoạt động của Surge/Hotspot:} Hệ thống phát hiện tổng cộng 344 bước thời gian trong trạng thái Surge. Trong các đợt Surge này, chiến lược định vị lại Hungarian chủ động đã thực hiện phân công các shipper rảnh rỗi di chuyển đón đầu nhu cầu tại các điểm nóng tổng cộng 65 lần, tối ưu đáng kể thời gian nhặt đơn tiếp theo.
+\end{itemize}
 
 \subsection{Đánh giá độ phức tạp}
 Gọi $V$ là số ô trống trên bản đồ, $C$ là số shipper, $A$ là số đơn active sau khi lọc, $I$ là số vòng ACO, $L$ là giới hạn số điểm dừng trong một route, $W$ là kích thước cửa sổ CBS, $B$ là số node CBS tối đa và $m$ là số shipper trong một nhóm xung đột.
@@ -778,6 +825,8 @@ O(B \cdot m \cdot WV \log(WV))
 \end{equation}
 Bộ nhớ gồm hàng đợi mục tiêu $O(CL)$, tập đơn active $O(A)$, các path CBS $O(mW)$ và cache đường đi. Nếu tiền xử lý APSP bằng PyTorch thành công, ma trận khoảng cách cần $O(V^2)$ bộ nhớ; nếu không, solver dùng BFS cache theo nhu cầu để giảm bộ nhớ nhưng tăng thời gian tra cứu.
 
+Về chi phí tính toán của bước định vị lại chủ động, thuật toán Hungarian chạy với độ phức tạp $O(n_{idle}^3)$ trong trường hợp xấu nhất, với $n_{idle}$ là số shipper rảnh rỗi ($n_{idle} \le C$). Vì quy mô số shipper tối đa là $C \le 25$, bước tính toán khớp cặp này rất nhanh và chỉ tốn khoảng dưới $1$ miligiây, không ảnh hưởng đến tổng ngân sách thời gian thực thi của solver.
+
 \subsection{Đánh giá thuật toán}
 MAPD-CBS trong project là một thuật toán \textbf{heuristic theo rolling horizon}. CBS nguyên thủy có thể tối ưu cho MAPF tĩnh khi được chạy đầy đủ trên toàn bộ cây ràng buộc và với mục tiêu cố định. Tuy nhiên, phiên bản triển khai đã giới hạn cửa sổ thời gian, cắt số node CBS, lọc đơn hàng và dùng fallback khi hết ngân sách. Vì vậy thuật toán không đảm bảo tối ưu toàn cục cho bài toán MAPD online, nhưng có khả năng tạo lời giải tốt và ổn định trong thời gian thực.
 
@@ -789,27 +838,106 @@ Nhược điểm là chi phí tính toán nhạy với mật độ shipper. Khi 
 % TỔNG HỢP
 % ---------------------------------------------
 \section{So sánh tổng hợp và Đánh giá}
+
 \subsection{So sánh về kết quả}
+
+Bảng~\ref{tab:compare-all} tổng hợp kết quả của cả bốn thuật toán.
+
+\begin{table}[htbp]
+\caption{So sánh tổng hợp các thuật toán trên Phase 1}
+\label{tab:compare-all}
+\centering
+\footnotesize
+\begin{tabular}{|l|r|c|c|c|r|}
+\hline
+\textbf{Thuật toán} & \textbf{Reward} & \textbf{Giao} & \textbf{Đúng hạn} & \textbf{Bỏ lỡ} & \textbf{Time} \\
+\hline
+Greedy BFS   & 5587.11 & 295/320 & 90.5\% & 25 &  2.38s \\
+VRP-OR-Tools & 5600.57 & 294/320 & 90.8\% & 26 &  2.89s \\
+ACO          & 5932.04 & 297/320 & 93.3\% & 23 &  2.00s \\
+MAPD-CBS     & 5820.70 & 296/320 & 90.2\% & 24 & 19.75s \\
+\hline
+\end{tabular}
+\end{table}
+
+Kết quả toàn bảng cho thấy hai thuật toán nâng cao vượt trội rõ ràng so với hai baseline. \textbf{ACO} dẫn đầu về Net Reward (5932.04) và tỷ lệ đúng hạn (93.3\%). Hai thuật toán baseline Greedy BFS và VRP-OR-Tools bám sát nhau (chênh lệch 13 điểm) và đều kém hai thuật toán nâng cao từ 220 đến 345 điểm.
+
+Xét theo từng cấu hình, một số xu hướng nổi bật:
+\begin{itemize}
+    \item \textbf{C1--C3 (bản đồ nhỏ):} Bốn thuật toán cho kết quả gần tương đương về Net Reward. ACO và VRP đều đạt 100\% đúng hạn ở C2; ACO là thuật toán duy nhất giữ 100\% đúng hạn liên tục từ C1 đến C3 với tổng zero đơn trễ.
+    \item \textbf{C4 (bản đồ trung bình):} ACO (1079.86) và MAPD-CBS (1065.64) vượt hẳn VRP (889.01), cho thấy kế hoạch vĩ mô của VRP bị ảnh hưởng bởi việc từ chối sớm các đơn có deadline căng. Greedy BFS (1006.37) cũng vượt VRP ở cấu hình này nhờ cơ chế Reward-Aware Scoring linh hoạt hơn.
+    \item \textbf{C5--C6 (bản đồ lớn):} MAPD-CBS bứt phá mạnh nhất (1391.89 và 1729.54) nhờ xử lý xung đột đa tác tử chuyên sâu. ACO đứng vị trí thứ hai (1461.62 và 1679.48), tiếp tục duy trì lợi thế về tỷ lệ đúng hạn dù số đơn trễ tăng theo quy mô bản đồ.
+\end{itemize}
 
 \subsection{Đánh giá mức độ hiệu quả}
 
+\begin{table*}[htbp]
+\caption{Đánh giá các tiêu chí theo từng thuật toán}
+\label{tab:criteria}
+\centering
+\footnotesize
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Tiêu chí}          & \textbf{Greedy} & \textbf{VRP} & \textbf{ACO} & \textbf{CBS} \\
+\hline
+Mức độ tối ưu       & Heuristic     & Near-optimal   & Meta-heuristic & Heuristic  \\
+Net Reward          & Thấp nhất     & Thấp nhì       & Cao nhất       & Cao nhì    \\
+Tỷ lệ đúng hạn      & 90.5\%        & 90.8\%         & 93.3\%         & 90.2\%     \\
+Tốc độ thực thi     & Nhanh         & Nhanh          & Nhanh nhất     & Chậm nhất  \\
+Xử lý va chạm       & Cơ bản        & Cơ bản         & Cơ bản         & Chuyên sâu \\
+Học từ lịch sử      & Không         & Không          & Có             & Có      \\
+Phân công toàn cục  & Không         & Có             & Một phần       & Một phần   \\
+Thích ứng Surge     & Có            & Có             & Có             & Có         \\
+\hline
+\end{tabular}
+\end{table*}
+
+Nhìn vào Bảng~\ref{tab:criteria}, mỗi thuật toán chiếm lĩnh một vùng năng lực riêng biệt. Greedy BFS và VRP-OR-Tools đều không đảm bảo tối ưu toàn cục nhưng đạt kết quả tiệm cận tối ưu trong thực tế nhờ hàm utility dựa trên phần thưởng thực. MAPD-CBS là thuật toán duy nhất xử lý triệt để va chạm không gian--thời gian, đánh đổi bằng chi phí tính toán cao nhất (19.75 giây, gấp gần 10 lần các thuật toán còn lại). ACO nổi bật trên cả hai chiều: vừa có Net Reward cao nhất, vừa chạy nhanh nhất (2.00 giây), đồng thời là thuật toán duy nhất tích lũy kinh nghiệm qua pheromone và pressure map mà không cần đọc cấu hình ẩn của môi trường.
+
+Về ràng buộc thực thi trên Kaggle (giới hạn 60 phút), cả bốn thuật toán đáp ứng thoải mái. Ngay cả MAPD-CBS với thời gian chạy cao nhất cũng chỉ tiêu thụ dưới 20 giây cho toàn bộ 6 cấu hình Phase~1.
+
 \subsection{Đánh đổi giữa các phương pháp}
+
+Bốn thuật toán thể hiện ba hướng đánh đổi chính:
+
+\subsubsection{Tốc độ và chất lượng lời giải}
+Greedy BFS hy sinh chất lượng phân công dài hạn để đổi lấy thời gian phản hồi tức thì ($O(C^2 M)$ mỗi bước). VRP-OR-Tools chấp nhận chi phí replan cao hơn ($O(C^2 M \log M)$) để có kế hoạch phân công toàn cục tốt hơn. ACO giữ được tốc độ tương đương Greedy BFS trong khi bổ sung bộ nhớ pheromone, đạt Net Reward cao nhất với thời gian thực thi thấp nhất --- đây là điểm mạnh cốt lõi của thiết kế meta-heuristic lai. MAPD-CBS đánh đổi thêm tài nguyên tính toán cho tầng CBS để có lợi thế phối hợp không gian, đặc biệt hiệu quả khi nhiều shipper cùng hoạt động trong vùng hẹp.
+
+\subsubsection{Phạm vi tối ưu hóa}
+Greedy BFS và ACO tối ưu cục bộ tại mỗi bước, trong khi VRP-OR-Tools lập kế hoạch vĩ mô theo chu kỳ replan. MAPD-CBS kết hợp cả hai: tầng ACO phân công ngắn hạn còn tầng CBS tối ưu chuyển động trong cửa sổ $W$ bước. Tuy nhiên, cả bốn thuật toán đều là các phương pháp rolling-horizon, không tối ưu toàn cục từ $t=0$ đến $T$. Kết quả thực nghiệm cho thấy ACO, dù là phương pháp online thuần túy, lại vượt cả VRP-OR-Tools -- một bộ giải lập kế hoạch có cấu trúc -- nhờ khả năng thích ứng nhanh với đơn hàng mới và cơ chế ưu tiên deadline hiệu quả.
+
+\subsubsection{Xử lý va chạm đa tác tử}
+Greedy BFS và VRP-OR-Tools xử lý va chạm theo kiểu phản ứng: chỉ giải quyết xung đột trực tiếp khi xảy ra. ACO bổ sung thêm bản đồ tắc nghẽn (congestion map) để tránh dồn shipper vào vùng đã bão hòa. MAPD-CBS đi xa hơn với Space-Time A* và cây ràng buộc, đảm bảo không va chạm trong cửa sổ $W$ bước tương lai nhưng cần cơ chế fallback khi CBS hết ngân sách. Paradox thú vị là dù ACO không có đảm bảo tránh va chạm chặt như CBS, thuật toán vẫn đạt Net Reward cao hơn nhờ quyết định nhận/giao đơn tốt hơn về mặt kinh tế, bù lại chi phí từ các va chạm cục bộ còn xảy ra.
 
 % ---------------------------------------------
 % KẾT LUẬN
 % ---------------------------------------------
 \section{Kết luận}
 
+Báo cáo này trình bày quá trình phát triển và đánh giá bốn thuật toán giải bài toán tối ưu hóa giao hàng đa tác tử thời gian thực: Greedy BFS cải tiến, VRP-OR-Tools, ACO và MAPD-CBS. Kết quả thực nghiệm trên bộ cấu hình Phase~1 cho thấy:
 
-% ---------------------------------------------
-% ĐÓNG GÓP
-% ---------------------------------------------
+\begin{itemize}
+    \item \textbf{ACO} đạt Net Reward cao nhất (5932.04) với tỷ lệ đúng hạn tốt nhất (93.3\%) và thời gian chạy nhanh nhất trong nhóm (2.00 giây). Cơ chế pheromone và pressure map giúp thuật toán học online từ lịch sử giao hàng, ưu tiên đúng deadline và thích ứng tự nhiên với surge/hotspot mà không cần đọc cấu hình ẩn. ACO được chọn làm phương án chính nộp Phase~2.
+
+    \item \textbf{MAPD-CBS} xếp thứ hai về Net Reward (5820.70) và dẫn đầu về số đơn giao được (296/320). Điểm mạnh riêng biệt của MAPD-CBS là khả năng phối hợp không gian--thời gian có tổ chức, đặc biệt hiệu quả ở C5--C6 khi mật độ shipper cao và bản đồ có nhiều hành lang hẹp.
+
+    \item \textbf{VRP-OR-Tools} đạt Net Reward 5600.57 với tỷ lệ đúng hạn 90.8\%, thể hiện giá trị của phân công toàn cục dựa trên utility thực. Tuy nhiên, bộ giải lộ trình nội bộ gặp hạn chế ở cấu hình trung bình (C4) khi từ chối quá sớm các đơn có deadline căng.
+
+    \item \textbf{Greedy BFS} dù là thuật toán đơn giản nhất, vẫn cạnh tranh sát sao với VRP (5587.11) với thời gian chạy 2.38 giây, khẳng định rằng thiết kế heuristic tốt có thể tiệm cận hiệu quả của các phương pháp phức tạp hơn trong nhiều kịch bản.
+\end{itemize}
+
+Điểm chung của cả bốn thuật toán là kiến trúc không phụ thuộc thư viện ngoài: mọi thành phần quan trọng đều có bản triển khai thuần Python dự phòng, đảm bảo hệ thống chạy đúng trên mọi môi trường Kaggle bất kể thư viện nào được cài sẵn.
+
+Hướng phát triển tiếp theo tập trung vào ba điểm: tăng cường khả năng dự báo surge/hotspot sớm hơn để reposition shipper trước khi đơn hàng bùng phát; cải thiện bộ giải lộ trình trong VRP khi số stop lớn; và nghiên cứu kết hợp phân công Hungarian của VRP với tầng tránh va chạm của CBS nhằm khai thác ưu điểm của cả hai phương pháp trong một kiến trúc lai thống nhất.
+
 \section{Đóng góp}
 \begin{itemize}
-    \item \textbf{Nguyễn Hải Nam:} 
-    \item \textbf{Nguyễn Việt Thắng:} 
-    \item \textbf{Võ Minh Dũng:} 
+    \item \textbf{Nguyễn Hải Nam:} Nghiên cứu ý tưởng cải tiến chung, Thực hiện cải tiến thuật toán Greedy BFS từ thuật toán cũ, Thực hiện xây dựng và tối ưu thuật toán VRP-OrTools, Thực hiện kiểm thử tất cả thuật toán, Viết báo cáo.
+    \item \textbf{Nguyễn Việt Thắng:} Nghiên cứu ý tưởng cải tiến chung, Thực hiện xây dựng và tối ưu thuật toán MAPD - CBS, Phụ trách sinh config kiểm thử, Thực hiện kiểm thử tất cả thuật toán, Viết báo cáo.
+    \item \textbf{Võ Minh Dũng:} Nghiên cứu ý tưởng cải tiến chung, Thực hiện xây dựng và tối ưu thuật toán ACO, Lên ý tưởng kịch bản kiểm thử, Thực hiện kiểm thử tất cả thuật toán, Viết báo cáo.
 \end{itemize}
+
+\end{document}
 
 % ---------------------------------------------
 % TÀI LIỆU THAM KHẢO
