@@ -37,10 +37,8 @@ MOVES: Tuple[str, ...] = ("U", "D", "L", "R")
 # ---------------------------------------------------------------------------
 # Tunable hyper-parameters
 # ---------------------------------------------------------------------------
-# [OPTIMIZED] Hạn chế chỉnh sửa các thông số tunable hyper-parameters dưới đây
-# vì đã được tinh chỉnh thực nghiệm tối ưu để cân bằng Net Reward và thời gian chạy.
 REPLAN_INTERVAL_SMALL = 5   # Δt cho config nhỏ (N < 18)
-REPLAN_INTERVAL_LARGE = 5   # Δt cho config lớn (N >= 18)
+REPLAN_INTERVAL_LARGE = 15   # Δt cho config lớn (N >= 18)
 ORTOOLS_TIME_LIMIT_S  = 5    # Giới hạn thời gian OR-Tools (giây)
 MAX_ACTIVE_ORDERS_SMALL = 150  # N < 50
 MAX_ACTIVE_ORDERS_LARGE = 60   # N >= 50 (tránh cost matrix quá lớn)
@@ -53,7 +51,6 @@ LATE_COST_SCALE       = 25   # Soft deadline penalty trên mỗi timestep trễ
 
 
 from solvers.shared.pathfinder import get_pathfinder
-from solvers.shared.precompute import get_precompute
 from solvers.shared.detector import OnlineSurgeHotspotDetector
 
 try:
@@ -63,42 +60,22 @@ except ImportError:
     HAS_SCIPY = False
 
 try:
+    import pulp
+    HAS_PULP = True
+except ImportError:
+    HAS_PULP = False
+
+try:
     import numpy as np
     HAS_NUMPY = True
 except ImportError:
     HAS_NUMPY = False
-    class MockNumPy:
-        ndarray = list
-        int32 = int
-        int64 = int
-        float64 = float
-        int16 = int
-        int8 = int
-        def zeros(self, *args, **kwargs):
-            return []
-        def array(self, *args, **kwargs):
-            return []
-        def ix_(self, *args, **kwargs):
-            return []
-        def argmax(self, *args, **kwargs):
-            return 0
-    np = MockNumPy()
 
 try:
-    if not HAS_NUMPY:
-        raise ImportError("numpy is not available")
-    import numba
-    from numba import njit
-    HAS_NUMBA = True
+    import cvxpy as cp
+    HAS_CVXPY = True
 except ImportError:
-    HAS_NUMBA = False
-    def njit(*args, **kwargs):
-        if len(args) == 1 and callable(args[0]):
-            return args[0]
-        def decorator(f):
-            return f
-        return decorator
-
+    HAS_CVXPY = False
 
 def python_linear_sum_assignment(cost_matrix):
     n = len(cost_matrix)
@@ -174,308 +151,6 @@ def linear_sum_assignment(cost_matrix):
     return python_linear_sum_assignment(cost_matrix)
 
 
-@njit
-def get_numba_r_base(w):
-    if w <= 0.2:  return 4.0
-    if w <= 3.0:  return 10.0
-    if w <= 10.0: return 15.0
-    if w <= 30.0: return 20.0
-    return 30.0
-
-@njit
-def get_numba_delivery_reward(w, et, p, t_delivery, T):
-    rb = get_numba_r_base(w)
-    alpha = np.array([0.0, 1.0, 2.0, 3.0])
-    beta  = np.array([0.0, 0.1, 0.3, 0.5])
-    if t_delivery <= et:
-        bonus = max(0.0, float(et - t_delivery) / max(float(et), 1.0))
-        return alpha[p] * rb * (1.0 + bonus)
-    factor = max(0.0, 1.0 - float(t_delivery - et) / max(float(T), 1.0))
-    return beta[p] * rb * factor
-
-@njit
-def search_optimal_routing_numba(
-    start_node_idx,
-    start_t,
-    initial_w,
-    initial_bag_size,
-    dist_matrix,
-    pickup_nodes,
-    delivery_nodes,
-    weights,
-    deadlines,
-    priorities,
-    in_bags,
-    W_max,
-    K_max,
-    T,
-    max_delivery_delay,
-    use_exact_cost,
-    route_limit,
-    late_penalty_coef
-):
-    M_orders = len(weights)
-    num_stops = 2 * M_orders
-    
-    stop_nodes = np.zeros(num_stops, dtype=np.int32)
-    stop_ops = np.zeros(num_stops, dtype=np.int32)
-    stop_weights = np.zeros(num_stops, dtype=np.float64)
-    stop_deadlines = np.zeros(num_stops, dtype=np.int32)
-    stop_priorities = np.zeros(num_stops, dtype=np.int32)
-    stop_order_ids = np.zeros(num_stops, dtype=np.int64)
-    
-    needed_stops = np.zeros(num_stops, dtype=np.int32)
-    initial_visited_mask = 0
-    total_needed_stops = 0
-    
-    for idx in range(M_orders):
-        # Pickup stop
-        stop_nodes[2 * idx] = pickup_nodes[idx]
-        stop_ops[2 * idx] = 1
-        stop_weights[2 * idx] = weights[idx]
-        stop_deadlines[2 * idx] = deadlines[idx]
-        stop_priorities[2 * idx] = priorities[idx]
-        stop_order_ids[2 * idx] = idx
-        
-        if in_bags[idx] == 1:
-            initial_visited_mask |= (1 << (2 * idx))
-        else:
-            needed_stops[2 * idx] = 1
-            total_needed_stops += 1
-            
-        # Delivery stop
-        stop_nodes[2 * idx + 1] = delivery_nodes[idx]
-        stop_ops[2 * idx + 1] = 2
-        stop_weights[2 * idx + 1] = weights[idx]
-        stop_deadlines[2 * idx + 1] = deadlines[idx]
-        stop_priorities[2 * idx + 1] = priorities[idx]
-        stop_order_ids[2 * idx + 1] = idx
-        needed_stops[2 * idx + 1] = 1
-        total_needed_stops += 1
-
-    # DFS stack
-    stack_u = np.zeros(2000, dtype=np.int32)
-    stack_t = np.zeros(2000, dtype=np.int32)
-    stack_w = np.zeros(2000, dtype=np.float64)
-    stack_bag = np.zeros(2000, dtype=np.int32)
-    stack_mask = np.zeros(2000, dtype=np.int32)
-    stack_score = np.zeros(2000, dtype=np.float64)
-    stack_depth = np.zeros(2000, dtype=np.int32)
-    stack_parent = np.zeros(2000, dtype=np.int32)
-    stack_last_stop = np.zeros(2000, dtype=np.int32)
-    
-    # History log to reconstruct path
-    log_u = np.zeros(500000, dtype=np.int32)
-    log_t = np.zeros(500000, dtype=np.int32)
-    log_w = np.zeros(500000, dtype=np.float64)
-    log_bag = np.zeros(500000, dtype=np.int32)
-    log_mask = np.zeros(500000, dtype=np.int32)
-    log_score = np.zeros(500000, dtype=np.float64)
-    log_depth = np.zeros(500000, dtype=np.int32)
-    log_parent = np.zeros(500000, dtype=np.int32)
-    log_last_stop = np.zeros(500000, dtype=np.int32)
-    log_ptr = 0
-    
-    # Initialize
-    stack_u[0] = start_node_idx
-    stack_t[0] = 0
-    stack_w[0] = initial_w
-    stack_bag[0] = initial_bag_size
-    stack_mask[0] = initial_visited_mask
-    stack_score[0] = 0.0
-    stack_depth[0] = 0
-    stack_parent[0] = -1
-    stack_last_stop[0] = -1
-    stack_ptr = 1
-    
-    best_score = -1e9
-    best_log_idx = -1
-    
-    iter_count = 0
-    while stack_ptr > 0:
-        iter_count += 1
-        if iter_count > 5000:
-            break
-        stack_ptr -= 1
-        curr_u = stack_u[stack_ptr]
-        curr_t = stack_t[stack_ptr]
-        curr_w = stack_w[stack_ptr]
-        curr_bag = stack_bag[stack_ptr]
-        curr_mask = stack_mask[stack_ptr]
-        curr_score = stack_score[stack_ptr]
-        curr_depth = stack_depth[stack_ptr]
-        curr_parent = stack_parent[stack_ptr]
-        curr_last_stop = stack_last_stop[stack_ptr]
-        
-        # Log state
-        if log_ptr < 500000:
-            log_idx = log_ptr
-            log_u[log_idx] = curr_u
-            log_t[log_idx] = curr_t
-            log_w[log_idx] = curr_w
-            log_bag[log_idx] = curr_bag
-            log_mask[log_idx] = curr_mask
-            log_score[log_idx] = curr_score
-            log_depth[log_idx] = curr_depth
-            log_parent[log_idx] = curr_parent
-            log_last_stop[log_idx] = curr_last_stop
-            log_ptr += 1
-        else:
-            log_idx = -1
-            
-        # Check if all needed stops are visited
-        all_visited = True
-        for s_idx in range(num_stops):
-            if needed_stops[s_idx] == 1 and (curr_mask & (1 << s_idx)) == 0:
-                all_visited = False
-                break
-                
-        if all_visited:
-            if curr_score > best_score:
-                best_score = curr_score
-                best_log_idx = log_idx
-            continue
-            
-        if not use_exact_cost:
-            # For non-exact cost, any intermediate state is a valid route
-            if curr_depth > 0:
-                if curr_score > best_score:
-                    best_score = curr_score
-                    best_log_idx = log_idx
-                    
-        if curr_depth >= route_limit:
-            continue
-            
-        # Collect and sort candidates to implement Heuristic Branch Ordering
-        num_candidates = 0
-        candidate_s_idx = np.zeros(num_stops, dtype=np.int32)
-        candidate_priority = np.zeros(num_stops, dtype=np.int32)
-        candidate_dist = np.zeros(num_stops, dtype=np.int32)
-        
-        for s_idx in range(num_stops):
-            if needed_stops[s_idx] == 0 or (curr_mask & (1 << s_idx)) != 0:
-                continue
-                
-            is_pickup = (stop_ops[s_idx] == 1)
-            
-            if is_pickup:
-                if curr_bag >= K_max or curr_w + stop_weights[s_idx] > W_max:
-                    continue
-            else:
-                pickup_s_idx = s_idx - 1
-                if (curr_mask & (1 << pickup_s_idx)) == 0:
-                    continue
-                    
-            nxt_node = stop_nodes[s_idx]
-            dist = dist_matrix[curr_u, nxt_node]
-            if dist >= 1e8:
-                continue
-                
-            # Temporal pruning
-            if is_pickup:
-                del_node = stop_nodes[s_idx + 1]
-                d_delivery = dist_matrix[nxt_node, del_node]
-                if start_t + curr_t + dist + d_delivery > stop_deadlines[s_idx] + max_delivery_delay:
-                    continue
-            else:
-                if start_t + curr_t + dist > stop_deadlines[s_idx] + max_delivery_delay:
-                    continue
-                    
-            candidate_s_idx[num_candidates] = s_idx
-            candidate_priority[num_candidates] = stop_priorities[s_idx]
-            candidate_dist[num_candidates] = dist
-            num_candidates += 1
-            
-        if num_candidates == 0:
-            continue
-            
-        # Sort candidates (worst first, best last)
-        for i in range(num_candidates - 1):
-            for j in range(i + 1, num_candidates):
-                pi = candidate_priority[i]
-                pj = candidate_priority[j]
-                di = candidate_dist[i]
-                dj = candidate_dist[j]
-                if (pi > pj) or (pi == pj and di < dj):
-                    tmp_s = candidate_s_idx[i]
-                    candidate_s_idx[i] = candidate_s_idx[j]
-                    candidate_s_idx[j] = tmp_s
-                    
-                    tmp_p = candidate_priority[i]
-                    candidate_priority[i] = candidate_priority[j]
-                    candidate_priority[j] = tmp_p
-                    
-                    tmp_d = candidate_dist[i]
-                    candidate_dist[i] = candidate_dist[j]
-                    candidate_dist[j] = tmp_d
-                    
-        # Push to stack
-        for i in range(num_candidates):
-            s_idx = candidate_s_idx[i]
-            is_pickup = (stop_ops[s_idx] == 1)
-            nxt_node = stop_nodes[s_idx]
-            dist = candidate_dist[i]
-            
-            next_t = curr_t + dist
-            next_bag = curr_bag + 1 if is_pickup else curr_bag - 1
-            next_w = curr_w + stop_weights[s_idx] if is_pickup else max(0.0, curr_w - stop_weights[s_idx])
-            
-            step_val = 0.0
-            if use_exact_cost:
-                if is_pickup:
-                    step_val = float(dist)
-                else:
-                    eta = start_t + next_t
-                    reward = get_numba_delivery_reward(stop_weights[s_idx], stop_deadlines[s_idx], stop_priorities[s_idx], eta, T)
-                    lateness = max(0, eta - stop_deadlines[s_idx])
-                    step_val = float(dist) + float(lateness) * 2.0 - reward * 30.0
-                next_score = curr_score - step_val
-            else:
-                if is_pickup:
-                    del_node = stop_nodes[s_idx + 1]
-                    d_delivery = dist_matrix[nxt_node, del_node]
-                    eta_delivery = start_t + next_t + d_delivery
-                    reward = get_numba_delivery_reward(stop_weights[s_idx], stop_deadlines[s_idx], stop_priorities[s_idx], eta_delivery, T)
-                    step_val = 100.0 + reward / (float(dist) + 1.0) - 0.1 * float(dist) + float(stop_priorities[s_idx]) * 0.5
-                else:
-                    eta = start_t + next_t
-                    reward = get_numba_delivery_reward(stop_weights[s_idx], stop_deadlines[s_idx], stop_priorities[s_idx], eta, T)
-                    step_score = reward / (float(dist) + 1.0) * 1.2 - 0.05 * float(dist)
-                    if eta > stop_deadlines[s_idx]:
-                        step_score -= float(eta - stop_deadlines[s_idx]) * late_penalty_coef
-                    step_val = 100.0 + step_score
-                next_score = curr_score + step_val
-                
-            if stack_ptr < 2000:
-                stack_u[stack_ptr] = nxt_node
-                stack_t[stack_ptr] = next_t
-                stack_w[stack_ptr] = next_w
-                stack_bag[stack_ptr] = next_bag
-                stack_mask[stack_ptr] = curr_mask | (1 << s_idx)
-                stack_score[stack_ptr] = next_score
-                stack_depth[stack_ptr] = curr_depth + 1
-                stack_parent[stack_ptr] = log_idx
-                stack_last_stop[stack_ptr] = s_idx
-                stack_ptr += 1
-
-    path_stops = []
-    if best_score > -1e8:
-        curr_log_idx = best_log_idx
-        while curr_log_idx != -1:
-            s_idx = log_last_stop[curr_log_idx]
-            if s_idx != -1:
-                encoded = int(stop_nodes[s_idx]) + 100000 * int(stop_ops[s_idx]) + 10000000 * int(stop_order_ids[s_idx])
-                path_stops.append(encoded)
-            curr_log_idx = log_parent[curr_log_idx]
-        path_stops.reverse()
-        
-    stops_arr = np.zeros(len(path_stops), dtype=np.int64)
-    for idx, val in enumerate(path_stops):
-        stops_arr[idx] = val
-        
-    return best_score, stops_arr
-
-
 # ===========================================================================
 # VRPOrToolsSolver
 # ===========================================================================
@@ -490,32 +165,21 @@ class VRPOrToolsSolver(Solver):
 
         # Khởi tạo PathFinder tăng tốc bởi GPU/CPU
         self.pathfinder = get_pathfinder(self.grid)
-        self.precompute = get_precompute(self.grid)
+
+        # Kế hoạch hiện tại: shipper_id → deque of (target_pos, cargo_op)
+        self._plans: Dict[int, deque] = {}
 
         # Đơn đã assign cho shipper nhưng chưa pickup
         self._assignment: Dict[int, int] = {}   # order_id → shipper_id
 
         self._last_plan_t: int = -99
-        self._base_replan_interval = (
+        self._replan_interval = (
             REPLAN_INTERVAL_LARGE if env.N >= 18 else REPLAN_INTERVAL_SMALL
         )
-        self._replan_interval = self._base_replan_interval
         self.max_active_orders = (
             MAX_ACTIVE_ORDERS_LARGE if env.N > 50 else MAX_ACTIVE_ORDERS_SMALL
         )
         self._prev_pending_count: int = 0
-        self.large_map_late_coef = 0.4
-        self.numba_late_coef = 0.2
-
-        # --- Adaptive replan: CPU benchmark & dynamic budget ---
-        self._cpu_speed_ratio = self._benchmark_cpu()
-        # Budget: chỉ giới hạn khi CPU chậm (ratio < 0.7). CPU nhanh → budget rất rộng
-        if self._cpu_speed_ratio >= 0.7:
-            self._replan_time_budget = 999.0  # không giới hạn
-        else:
-            self._replan_time_budget = max(0.5, 0.3 / self._cpu_speed_ratio)
-        self._last_replan_duration = 0.0
-        self._replan_durations = []  # rolling window
 
         from env import is_valid_cell, valid_next_pos
         adj = {}
@@ -532,8 +196,14 @@ class VRPOrToolsSolver(Solver):
         self._adj = adj
 
         # Thống kê bottleneck ratio để tránh tắc nghẽn
+        def local_is_bottleneck(pos):
+            r, c = pos
+            return sum(
+                1 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                if 0 <= r + dr < len(self.grid) and 0 <= c + dc < len(self.grid[0]) and self.grid[r + dr][c + dc] == 0
+            ) <= 2
         free_cells = list(adj.keys())
-        bn_count = sum(1 for pos in free_cells if self.precompute.is_bottleneck(pos))
+        bn_count = sum(1 for pos in free_cells if local_is_bottleneck(pos))
         self.bottleneck_ratio = bn_count / len(free_cells) if free_cells else 0.0
 
         # Khởi tạo detector
@@ -569,21 +239,7 @@ class VRPOrToolsSolver(Solver):
         avg_dist = total_dist / pair_count if pair_count > 0 else 10.0
         self.avg_dist = avg_dist
 
-        # Dynamically scale late coefficients based on avg_dist
-        if avg_dist <= 90.0:
-            self.large_map_late_coef = 0.4
-            self.numba_late_coef = 0.2
-        elif avg_dist >= 115.0:
-            self.large_map_late_coef = 0.8
-            self.numba_late_coef = 0.5
-        else:
-            t = (avg_dist - 90.0) / 25.0
-            self.large_map_late_coef = 0.4 + t * 0.4
-            self.numba_late_coef = 0.2 + t * 0.3
-
-
         def interpolate(x, x_pts, y_pts):
-
             if x <= x_pts[0]:
                 return y_pts[0]
             if x >= x_pts[-1]:
@@ -594,10 +250,9 @@ class VRPOrToolsSolver(Solver):
                     return y_pts[i] + t * (y_pts[i+1] - y_pts[i])
             return y_pts[-1]
 
-        # DO NOT MODIFY: This heuristic configuration is tuned for maximum delivery performance.
         if env.N > 50:
             self.max_opp_dist = max(30, int(round(avg_dist * 0.95)))
-            self.max_delivery_delay = 600
+            self.max_delivery_delay = max(180, int(round(avg_dist * 4.5)))
         elif env.N > 18:
             self.max_delivery_delay = 60
             self.max_opp_dist = 25
@@ -608,32 +263,28 @@ class VRPOrToolsSolver(Solver):
             self.max_delivery_delay = max(5, int(round(interpolate(avg_dist, x_pts, y_delay))))
             self.max_opp_dist = max(10, int(round(interpolate(avg_dist, x_pts, y_opp))))
 
-    def _benchmark_cpu(self) -> float:
-        """Quick CPU benchmark. Returns speed ratio vs reference (1.0 = fast desktop)."""
-        import time as _time
-        t0 = _time.perf_counter()
-        s = 0
-        for i in range(500_000):
-            s += i
-        elapsed = _time.perf_counter() - t0
-        # Reference: fast desktop ~0.025s for 500K loop
-        ref_time = 0.025
-        ratio = ref_time / max(elapsed, 0.001)
-        return min(ratio, 2.0)  # cap at 2x
-
 
     # -----------------------------------------------------------------------
     # BFS utilities
     # -----------------------------------------------------------------------
 
+    def _bfs(self, start: Position, goal: Position) -> Tuple[int, List[Move]]:
+        """BFS với cache."""
+        return self.pathfinder.dist(start, goal), self.pathfinder.path(start, goal)
+
     def _dist(self, a: Position, b: Position) -> int:
-        if not self.precompute.are_connected(a, b):
-            return INF
         return self.pathfinder.dist(a, b)
+
+    def _path(self, a: Position, b: Position) -> List[Move]:
+        return self.pathfinder.path(a, b)
 
     def _is_bottleneck(self, pos: Position) -> bool:
         """Kiểm tra ô pos có phải nút cổ chai (<= 2 ô trống xung quanh) hay không."""
-        return self.precompute.is_bottleneck(pos)
+        r, c = pos
+        return sum(
+            1 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            if 0 <= r + dr < len(self.grid) and 0 <= c + dc < len(self.grid[0]) and self.grid[r + dr][c + dc] == 0
+        ) <= 2
 
     def _bfs_path_avoiding(self, start: Position, goal: Position, other_positions: Set[Position]) -> Optional[List[Move]]:
         if start == goal:
@@ -842,12 +493,12 @@ class VRPOrToolsSolver(Solver):
                         max_p = reward * 24.0
                         lateness_penalties += min(max_p, (eta - o.et) * 8.0)
                     else:
-                        lateness_penalties += (eta - o.et) * self.large_map_late_coef
+                        # Map lớn: phạt 2.5 để shipper tránh đi quá xa trễ nặng
+                        lateness_penalties += (eta - o.et) * 2.5
         
         total_reward = sum(delivered_rewards.values())
         move_cost = elapsed * 1.5
         
-        # DO NOT MODIFY: Utility coefficients are tuned for optimal behavior
         utility = total_reward * 40.0 - lateness_penalties - move_cost
         return utility
 
@@ -924,58 +575,6 @@ class VRPOrToolsSolver(Solver):
     # VRP planner (OR-Tools)
     # -----------------------------------------------------------------------
 
-    def _prepare_numba_inputs(
-        self,
-        s_position: Position,
-        all_orders: List[Order],
-        initial_carried: Set[int]
-    ) -> Tuple[List[Position], Dict[Position, int], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        locations = [s_position]
-        for o in all_orders:
-            locations.append((o.sx, o.sy))
-            locations.append((o.ex, o.ey))
-        unique_locs = []
-        seen = set()
-        for loc in locations:
-            if loc not in seen:
-                seen.add(loc)
-                unique_locs.append(loc)
-        U = len(unique_locs)
-        loc_to_idx = {loc: idx for idx, loc in enumerate(unique_locs)}
-        dist_matrix = np.zeros((U, U), dtype=np.int32)
-        for i in range(U):
-            for j in range(i + 1, U):
-                d = self._dist(unique_locs[i], unique_locs[j])
-                dist_matrix[i, j] = d
-                dist_matrix[j, i] = d
-        
-        M_orders = len(all_orders)
-        pickup_nodes = np.zeros(M_orders, dtype=np.int32)
-        delivery_nodes = np.zeros(M_orders, dtype=np.int32)
-        weights = np.zeros(M_orders, dtype=np.float64)
-        deadlines = np.zeros(M_orders, dtype=np.int32)
-        priorities = np.zeros(M_orders, dtype=np.int32)
-        in_bags = np.zeros(M_orders, dtype=np.int32)
-        for idx, o in enumerate(all_orders):
-            pickup_nodes[idx] = loc_to_idx[(o.sx, o.sy)]
-            delivery_nodes[idx] = loc_to_idx[(o.ex, o.ey)]
-            weights[idx] = o.w
-            deadlines[idx] = o.et
-            priorities[idx] = o.p
-            in_bags[idx] = 1 if o.id in initial_carried else 0
-            
-        return (
-            unique_locs,
-            loc_to_idx,
-            dist_matrix,
-            pickup_nodes,
-            delivery_nodes,
-            weights,
-            deadlines,
-            priorities,
-            in_bags
-        )
-
     def _build_route_for_shipper(self, s: Shipper, assigned_orders: List[Order], obs: dict, limit: Optional[int] = None) -> List[RouteStop]:
         orders = obs["orders"]
         obs_t = obs["t"]
@@ -993,102 +592,7 @@ class VRPOrToolsSolver(Solver):
         initial_pickups = set(o.id for o in assigned_orders)
         initial_deliveries = initial_carried | initial_pickups
         total_possible_stops = 2 * len(initial_pickups) + len(initial_carried)
-
-        # -------------------------------------------------------------------
-        # Numba JIT optimal routing solver integration
-        # -------------------------------------------------------------------
-        if HAS_NUMBA and total_possible_stops <= 10:
-            try:
-                all_orders = carried + assigned_orders
-                M_orders = len(all_orders)
-                if M_orders > 0:
-                    (
-                        unique_locs,
-                        loc_to_idx,
-                        dist_matrix,
-                        pickup_nodes,
-                        delivery_nodes,
-                        weights,
-                        deadlines,
-                        priorities,
-                        in_bags
-                    ) = self._prepare_numba_inputs(s.position, all_orders, initial_carried)
-                    use_exact_cost = (self.env.N <= 10)
-                    score_val, stops_arr = search_optimal_routing_numba(
-                        loc_to_idx[s.position],
-                        obs_t,
-                        sum(o.w for o in carried),
-                        len(carried),
-                        dist_matrix,
-                        pickup_nodes,
-                        delivery_nodes,
-                        weights,
-                        deadlines,
-                        priorities,
-                        in_bags,
-                        s.W_max,
-                        s.K_max,
-                        self.env.T,
-                        self.max_delivery_delay,
-                        use_exact_cost,
-                        route_limit,
-                        self.numba_late_coef
-                    )
-                    if use_exact_cost and (score_val < -1e8 or len(stops_arr) == 0):
-                        score_val, stops_arr = search_optimal_routing_numba(
-                            loc_to_idx[s.position],
-                            obs_t,
-                            sum(o.w for o in carried),
-                            len(carried),
-                            dist_matrix,
-                            pickup_nodes,
-                            delivery_nodes,
-                            weights,
-                            deadlines,
-                            priorities,
-                            in_bags,
-                            s.W_max,
-                            s.K_max,
-                            self.env.T,
-                            self.max_delivery_delay,
-                            False,
-                            route_limit,
-                            self.numba_late_coef
-                        )
-                    if score_val > -1e8 and len(stops_arr) > 0:
-                        route_stops = []
-                        for encoded in stops_arr:
-                            node_idx = encoded % 100000
-                            op = (encoded % 10000000) // 100000
-                            oid_idx = encoded // 10000000
-                            pos = unique_locs[node_idx]
-                            actual_oid = all_orders[oid_idx].id
-                            route_stops.append((pos, op, actual_oid))
-                        return route_stops
-            except Exception as e:
-                pass
-
-
-        # Precompute pairwise distances of relevant positions
-        relevant_positions = [s.position]
-        for o in carried:
-            relevant_positions.append((o.ex, o.ey))
-        for o in assigned_orders:
-            relevant_positions.append((o.sx, o.sy))
-            relevant_positions.append((o.ex, o.ey))
-        unique_positions = list(set(relevant_positions))
         
-        loc_dist = {}
-        for i, pos1 in enumerate(unique_positions):
-            for pos2 in unique_positions[i:]:
-                d = self._dist(pos1, pos2)
-                loc_dist[(pos1, pos2)] = d
-                loc_dist[(pos2, pos1)] = d
-                
-        def get_dist(p1: Position, p2: Position) -> int:
-            return loc_dist.get((p1, p2), INF)
-
-        max_rewards = {o.id: delivery_reward(o, 0, self.env.T) for o in carried + assigned_orders}
         use_exact_cost = (self.env.N <= 10)
         best_eval = -INF
         best_route = []
@@ -1096,30 +600,6 @@ class VRPOrToolsSolver(Solver):
         # Đệ quy quay lui để tìm chuỗi hành động tối ưu
         def search(curr_pos, elapsed, curr_weight, curr_bag_size, curr_route, curr_carried, pending_pickups, pending_deliveries, current_score):
             nonlocal best_eval, best_route
-            
-            # Cắt tỉa nhánh cận (Branch and Bound Pruning)
-            if best_eval > -INF:
-                if use_exact_cost:
-                    min_rem_d = 0
-                    remaining_targets = []
-                    for oid in pending_pickups:
-                        o = orders[oid]
-                        remaining_targets.append((o.sx, o.sy))
-                        min_rem_d += get_dist((o.sx, o.sy), (o.ex, o.ey))
-                    for oid in pending_deliveries:
-                        o = orders[oid]
-                        remaining_targets.append((o.ex, o.ey))
-                    
-                    if remaining_targets:
-                        min_rem_d += min(get_dist(curr_pos, tgt) for tgt in remaining_targets)
-                        
-                    est_best_score = -current_score + sum([max_rewards[oid] for oid in pending_deliveries]) * 30.0 - min_rem_d
-                    if est_best_score < best_eval:
-                        return
-                else:
-                    est_best_score = current_score + sum([100.0 + max_rewards[oid] + orders[oid].p * 0.5 for oid in pending_pickups]) + sum([100.0 + max_rewards[oid] * 1.2 for oid in pending_deliveries])
-                    if est_best_score < best_eval:
-                        return
             
             if curr_route:
                 if not use_exact_cost:
@@ -1137,61 +617,58 @@ class VRPOrToolsSolver(Solver):
             if len(curr_route) >= route_limit:
                 return
                 
-            candidates = []
-            
-            # 1. Thu thập các điểm pickup khả thi
+            # 1. Thử đi đến một điểm pickup
             if curr_bag_size < s.K_max:
-                for oid in pending_pickups:
+                for oid in list(pending_pickups):
                     o = orders[oid]
                     if curr_weight + o.w <= s.W_max:
                         dst = (o.sx, o.sy)
-                        d = get_dist(curr_pos, dst)
-                        if d < INF:
-                            d_delivery = get_dist(dst, (o.ex, o.ey))
-                            if obs_t + elapsed + d + d_delivery <= o.et + self.max_delivery_delay:
-                                if use_exact_cost:
-                                    step_val = d
-                                else:
-                                    est_eta = obs_t + elapsed + d + d_delivery
-                                    reward = delivery_reward(o, est_eta, self.env.T)
-                                    step_val = 100.0 + reward / (d + 1) - 0.1 * d + o.p * 0.5
-                                candidates.append((oid, 1, dst, o, d, step_val))
-                                
-            # 2. Thu thập các điểm delivery khả thi
-            for oid in pending_deliveries:
+                        d = self._dist(curr_pos, dst)
+                        if d >= INF:
+                            continue
+                            
+                        new_pickups = pending_pickups - {oid}
+                        new_carried = curr_carried | {oid}
+                        
+                        if use_exact_cost:
+                            step_val = d
+                        else:
+                            d_delivery = self._dist(dst, (o.ex, o.ey))
+                            est_eta = obs_t + elapsed + d + d_delivery
+                            reward = delivery_reward(o, est_eta, self.env.T)
+                            step_val = 100.0 + reward / (d + 1) - 0.1 * d + o.p * 0.5
+                            
+                        search(
+                            dst, elapsed + d, curr_weight + o.w, curr_bag_size + 1,
+                            curr_route + [(oid, 1, dst)],
+                            new_carried, new_pickups, pending_deliveries,
+                            current_score + step_val
+                        )
+                        
+            # 2. Thử đi đến một điểm delivery
+            for oid in list(pending_deliveries):
                 if oid in curr_carried:
                     o = orders[oid]
                     dst = (o.ex, o.ey)
-                    d = get_dist(curr_pos, dst)
-                    if d < INF:
-                        est_eta = obs_t + elapsed + d
-                        reward = delivery_reward(o, est_eta, self.env.T)
-                        if use_exact_cost:
-                            lateness = max(0, est_eta - o.et)
-                            step_val = d + lateness * 2.0 - reward * 30.0
-                        else:
-                            step_score = reward / (d + 1) * 1.2 - 0.05 * d
-                            if est_eta > o.et:
-                                step_score -= (est_eta - o.et) * self.numba_late_coef
-                            step_val = 100.0 + step_score
-                        candidates.append((oid, 2, dst, o, d, step_val))
-            
-            # Sắp xếp theo thứ tự ưu tiên: Ưu tiên đơn Hỏa tốc trước, sau đó là điểm gần nhất
-            candidates.sort(key=lambda x: (-x[3].p, x[4]))
-            
-            for oid, op, dst, o, d, step_val in candidates:
-                if op == 1:
-                    new_pickups = pending_pickups - {oid}
-                    new_carried = curr_carried | {oid}
-                    search(
-                        dst, elapsed + d, curr_weight + o.w, curr_bag_size + 1,
-                        curr_route + [(oid, 1, dst)],
-                        new_carried, new_pickups, pending_deliveries,
-                        current_score + step_val
-                    )
-                else:
+                    d = self._dist(curr_pos, dst)
+                    if d >= INF:
+                        continue
+                        
+                    est_eta = obs_t + elapsed + d
+                    reward = delivery_reward(o, est_eta, self.env.T)
+                    
+                    if use_exact_cost:
+                        lateness = max(0, est_eta - o.et)
+                        step_val = d + lateness * 2.0 - reward * 30.0
+                    else:
+                        step_score = reward / (d + 1) * 1.2 - 0.05 * d
+                        if est_eta > o.et:
+                            step_score -= (est_eta - o.et) * 0.5
+                        step_val = 100.0 + step_score
+                        
                     new_deliveries = pending_deliveries - {oid}
                     new_carried = curr_carried - {oid}
+                    
                     search(
                         dst, elapsed + d, max(0.0, curr_weight - o.w), max(0, curr_bag_size - 1),
                         curr_route + [(oid, 2, dst)],
@@ -1321,55 +798,25 @@ class VRPOrToolsSolver(Solver):
             if not o.picked and not o.delivered
         ]
 
-        # Lọc các đơn hàng không thể tiếp cận bởi bất kỳ shipper nào
-        unpicked = [
-            o for o in unpicked
-            if any(self.precompute.are_connected(s.position, (o.sx, o.sy)) for s in shippers)
-        ]
-
         if not unpicked and not any(s.bag for s in shippers):
             return None
 
         if unpicked:
-            has_numpy_torch = False
-            if HAS_NUMPY and self.pathfinder.has_torch:
-                sh_indices = [self.pathfinder.cell_to_idx[s.position] for s in shippers if s.position in self.pathfinder.cell_to_idx]
-                if sh_indices:
-                    o_indices = [self.pathfinder.cell_to_idx[(o.sx, o.sy)] for o in unpicked if (o.sx, o.sy) in self.pathfinder.cell_to_idx]
-                    if len(o_indices) == len(unpicked):
-                        import numpy as np
-                        dist_matrix = self.pathfinder.dist_matrix[np.ix_(sh_indices, o_indices)]
-                        min_dists = dist_matrix.min(axis=0)
-                        order_keys = []
-                        for idx, o in enumerate(unpicked):
-                            min_d = int(min_dists[idx])
-                            order_keys.append(((-o.p, min_d, o.et), o))
-                        order_keys.sort(key=lambda x: x[0])
-                        unpicked = [o for _, o in order_keys]
-                        has_numpy_torch = True
-            
-            if not has_numpy_torch:
-                def order_priority_key(o: Order):
-                    min_d = min(self._dist(s.position, (o.sx, o.sy)) for s in shippers)
-                    return (-o.p, min_d, o.et)
-                unpicked.sort(key=order_priority_key)
-            
+            def order_priority_key(o: Order):
+                min_d = min(self._dist(s.position, (o.sx, o.sy)) for s in shippers)
+                return (-o.p, min_d, o.et)
+            unpicked.sort(key=order_priority_key)
             max_act = 150 if self.env.N > 50 else self.max_active_orders
             unpicked = unpicked[:max_act]
 
         # Bộ lọc khoảng cách động theo N và C (số lượng shipper)
         num_shippers = len(shippers)
         dist_factor = 2.0 if num_shippers <= 3 else 1.0
-        # Dynamic distance filtering based on unpicked orders density
         if self.env.N > 50:
-            if len(unpicked) < 15:
-                max_dist = max(100, self.max_opp_dist * 3.5) * dist_factor
-            elif len(unpicked) < 35:
-                max_dist = max(75, self.max_opp_dist * 2.5) * dist_factor
-            else:
-                max_dist = max(55, self.max_opp_dist * 1.8) * dist_factor
+            max_dist = max(45, self.max_opp_dist * 1.5) * dist_factor
+        elif self.env.N > 18:
+            max_dist = max(30, self.max_opp_dist * 1.8) * dist_factor
         else:
-            # DO NOT MODIFY: Giữ nguyên max_dist = 999.0 cho map nhỏ/trung bình (N <= 50) để shipper di chuyển tự do gom đơn hàng
             max_dist = 999.0
 
         def get_capacity_limit(s: Shipper):
@@ -1378,12 +825,7 @@ class VRPOrToolsSolver(Solver):
         assigned_map: Dict[int, List[Order]] = {s.id: [] for s in shippers}
 
         max_rounds = max(get_capacity_limit(s) for s in shippers)
-        replan_t0 = time.perf_counter()
         for round_idx in range(max_rounds):
-            # Time budget: early exit nếu quá chậm
-            if time.perf_counter() - replan_t0 > self._replan_time_budget:
-                break
-
             already_assigned_ids = {o.id for orders_list in assigned_map.values() for o in orders_list}
             unassigned_active = [o for o in unpicked if o.id not in already_assigned_ids]
             if not unassigned_active:
@@ -1402,40 +844,29 @@ class VRPOrToolsSolver(Solver):
                 route_base = self._build_route_for_shipper(s, assigned_map[s.id], obs)
                 baseline_util = self._evaluate_route_utility(s, route_base, obs)
                 
-                # Ước tính vị trí rảnh tay và thời gian của shipper sau khi giao xong bag
-                elapsed_bag, end_pos = self._estimate_bag_delivery(s, orders)
+                # Ước tính vị trí rảnh tay của shipper sau khi giao xong bag
+                _, end_pos = self._estimate_bag_delivery(s, orders)
 
-                # Nới rộng max_dist dựa trên khoảng cách đến đơn hàng chưa giao gần nhất để tránh shipper bị rảnh tay
-                if len(s.bag) == 0 and len(assigned_map[s.id]) == 0:
+                # Chỉ nới rộng max_dist khi là map mật độ cao và shipper thực sự rảnh tay
+                is_dense_map = (self.env.G >= 1000 or self.env.C >= 20)
+                if is_dense_map and len(s.bag) == 0 and len(assigned_map[s.id]) == 0:
                     d_min = min((self._dist(end_pos, (o_temp.sx, o_temp.sy)) for o_temp in unassigned_active), default=1e9)
-                    s_max_dist = max(max_dist, d_min + 35) if d_min < 1e8 else max_dist
+                    s_max_dist = max(max_dist, d_min + 15) if d_min < 1e8 else max_dist
                 else:
-                    bag_len = len(s.bag) + len(assigned_map[s.id])
-                    if self.env.C >= 15:
-                        if bag_len >= 2:
-                            s_max_dist = max_dist
-                        else:
-                            s_max_dist = max_dist + 25 if self.env.N > 50 else max_dist
-                    else:
-                        d_min = min((self._dist(end_pos, (o_temp.sx, o_temp.sy)) for o_temp in unassigned_active), default=1e9)
-                        s_max_dist = max(max_dist, d_min + 35) if d_min < 1e8 else max_dist
+                    s_max_dist = max_dist
 
-                # Pre-filter orders for this shipper based on estimated utility
                 row_cost = []
                 for o in unassigned_active:
                     if current_weight + o.w > s.W_max:
                         row_cost.append(1e9)
                         continue
+                        
+                    # Lọc khoảng cách nhanh từ end_pos
                     d_pick = self._dist(end_pos, (o.sx, o.sy))
                     if d_pick > s_max_dist:
                         row_cost.append(1e9)
                         continue
-                    d_pick_direct = self._dist(s.position, (o.sx, o.sy))
-                    d_del_direct = self._dist((o.sx, o.sy), (o.ex, o.ey))
-                    if obs_t + d_pick_direct + d_del_direct > o.et + self.max_delivery_delay:
-                        row_cost.append(1e9)
-                        continue
-
+                        
                     route_new = self._build_route_for_shipper(s, assigned_map[s.id] + [o], obs)
                     if not route_new:
                         row_cost.append(1e9)
@@ -1622,15 +1053,11 @@ class VRPOrToolsSolver(Solver):
 
         # --- Priority 3: Reposition if surge ---
         if len(s.bag) == 0 and self.detector.is_surge and self.detector.predicted_hotspots:
-            best_hotspot = None
-            if self.env.N >= 50:
-                best_hotspot = self._shipper_hotspot_assignments.get(s.id)
-            if not best_hotspot:
-                best_hotspot = min(
-                    self.detector.predicted_hotspots,
-                    key=lambda hp: self._dist(s.position, hp)
-                )
-            if best_hotspot and best_hotspot != s.position:
+            best_hotspot = min(
+                self.detector.predicted_hotspots,
+                key=lambda hp: self._dist(s.position, hp)
+            )
+            if best_hotspot != s.position:
                 self._shipper_goals[s.id] = best_hotspot
                 return self._navigate_to(s, best_hotspot, cargo_op_at_goal=0)
 
@@ -1647,6 +1074,20 @@ class VRPOrToolsSolver(Solver):
         if next_pos == goal:
             return (move, cargo_op_at_goal)
         return (move, 0)
+
+    def _live_cargo_op(self, pos: Position, s: Shipper, obs: dict) -> int:
+        """Xác định cargo_op tại pos từ live obs."""
+        orders = obs["orders"]
+        for oid in s.bag:
+            if oid in orders:
+                o = orders[oid]
+                if not o.delivered and (o.ex, o.ey) == pos:
+                    return 2
+        for o in orders.values():
+            if not o.picked and not o.delivered and (o.sx, o.sy) == pos:
+                if s.can_carry(o, orders):
+                    return 1
+        return 0
 
     def _greedy_pick(self, s: Shipper, obs: dict) -> Action:
         """Greedy: chọn đơn gần nhất chưa picked (với deadline filter + batch reserve)."""
@@ -1736,18 +1177,6 @@ class VRPOrToolsSolver(Solver):
         if time_since_last >= self._replan_interval:
             return True
 
-        # Nếu có đơn hàng mới, cho phép re-plan ngay lập tức để không bỏ lỡ đơn
-        if obs.get("new_order_ids"):
-            return True
-
-        # Tránh re-plan quá dày đặc bằng cách áp đặt cooldown tối thiểu trước các điều kiện rảnh tay
-        if self.env.N >= 50:
-            min_cooldown = 2 if self.env.N > 50 else 1
-        else:
-            min_cooldown = min(5, self._replan_interval)
-        if time_since_last < min_cooldown:
-            return False
-
         shippers = obs["shippers"]
         orders = obs["orders"]
 
@@ -1766,6 +1195,14 @@ class VRPOrToolsSolver(Solver):
         if has_idle_shipper and has_unassigned:
             return True
 
+        # Áp dụng cooldown tối thiểu để tránh replan quá dày đặc
+        min_cooldown = min(5, self._replan_interval)
+        if time_since_last < min_cooldown:
+            return False
+
+        if obs.get("new_order_ids") and has_unassigned:
+            return True
+
         if has_unassigned:
             for s in shippers:
                 if not self._targets.get(s.id):
@@ -1775,25 +1212,7 @@ class VRPOrToolsSolver(Solver):
 
     def _replan(self, obs: dict) -> None:
         self._last_plan_t = obs["t"]
-        t0 = time.perf_counter()
         routes = self._run_vrp_exact(obs)
-        self._last_replan_duration = time.perf_counter() - t0
-        self._replan_durations.append(self._last_replan_duration)
-        if len(self._replan_durations) > 10:
-            self._replan_durations.pop(0)
-
-        # Adaptive interval: chỉ tăng interval khi CPU chậm VÀ replan tốn nhiều thời gian
-        avg_dur = sum(self._replan_durations) / len(self._replan_durations)
-        if self._cpu_speed_ratio < 0.7:
-            if avg_dur > 0.5:
-                self._replan_interval = min(self._base_replan_interval * 3, 15)
-            elif avg_dur > 0.2:
-                self._replan_interval = min(self._base_replan_interval * 2, 10)
-            else:
-                self._replan_interval = self._base_replan_interval
-        else:
-            self._replan_interval = self._base_replan_interval
-
         if routes is not None:
             new_targets = self._extract_targets(routes, obs)
             for s_id, tgts in new_targets.items():
@@ -1815,7 +1234,6 @@ class VRPOrToolsSolver(Solver):
 
         self._targets: Dict[int, deque] = {}
         self._assignment = {}
-        self._shipper_hotspot_assignments = {}
         for s in obs["shippers"]:
             self._targets[s.id] = deque()
 
@@ -1836,62 +1254,6 @@ class VRPOrToolsSolver(Solver):
             self._seen_order_ids.update(current_order_ids)
             self.detector.update(current_t, new_order_ids, orders)
 
-            # Phân bổ hotspot cho shipper rảnh (tránh tụ tập tại một nơi)
-            # DO NOT MODIFY: Chỉ áp dụng matching cho map lớn N >= 50. Map nhỏ chạy matching bị giảm điểm.
-            self._shipper_hotspot_assignments = {}
-            if self.env.N >= 50 and self.detector.is_surge and self.detector.predicted_hotspots:
-                idle_shippers = [
-                    s for s in shippers_list
-                    if len(s.bag) == 0 and not self._targets.get(s.id)
-                ]
-                if idle_shippers:
-                    hotspots = self.detector.predicted_hotspots
-                    if self.env.N < 100:
-                        # Map trung bình: phân phối theo tỷ lệ điểm số (có lợi vì khoảng cách di chuyển vừa phải)
-                        scores = [self.detector.hotspot_scores.get(hp, 1.0) for hp in hotspots]
-                        total_score = sum(scores) if sum(scores) > 0.0 else 1.0
-                        
-                        target_allocations = []
-                        for hp, score in zip(hotspots, scores):
-                            alloc = int(round(len(idle_shippers) * (score / total_score)))
-                            alloc = max(1, alloc)
-                            target_allocations.append((hp, alloc))
-                        
-                        replicated_hotspots = []
-                        for hp, alloc in target_allocations:
-                            replicated_hotspots.extend([hp] * alloc)
-                        
-                        while len(replicated_hotspots) < len(idle_shippers):
-                            best_hp = max(hotspots, key=lambda hp: self.detector.hotspot_scores.get(hp, 0.0))
-                            replicated_hotspots.append(best_hp)
-                        while len(replicated_hotspots) > len(idle_shippers):
-                            hp_counts = {hp: replicated_hotspots.count(hp) for hp in hotspots}
-                            removable_hps = [hp for hp, count in hp_counts.items() if count > 1]
-                            if removable_hps:
-                                worst_hp = min(removable_hps, key=lambda hp: self.detector.hotspot_scores.get(hp, 0.0))
-                                replicated_hotspots.remove(worst_hp)
-                            else:
-                                replicated_hotspots.pop()
-                    else:
-                        # Map cực lớn (N >= 100): phân phối đều tuyệt đối để tránh dồn shipper vào một góc
-                        max_shippers_per_hotspot = max(1, len(idle_shippers) // len(hotspots))
-                        replicated_hotspots = []
-                        for hp in hotspots:
-                            for _ in range(max_shippers_per_hotspot):
-                                replicated_hotspots.append(hp)
-                    
-                    cost_matrix = []
-                    for s_idle in idle_shippers:
-                        row = [self._dist(s_idle.position, hp) for hp in replicated_hotspots]
-                        cost_matrix.append(row)
-                    
-                    row_ind, col_ind = linear_sum_assignment(cost_matrix)
-                    for r, c in zip(row_ind, col_ind):
-                        if r < len(idle_shippers) and c < len(replicated_hotspots):
-                            s_idle = idle_shippers[r]
-                            hp = replicated_hotspots[c]
-                            self._shipper_hotspot_assignments[s_idle.id] = hp
-
             # Thiết lập biến tránh kẹt nút cổ chai
             self._all_shippers = shippers_list
             self._all_shipper_positions = {s.position for s in shippers_list}
@@ -1900,13 +1262,6 @@ class VRPOrToolsSolver(Solver):
                 tgt_queue = self._targets.get(s.id)
                 if tgt_queue and len(tgt_queue) > 0:
                     self._shipper_goals[s.id] = tgt_queue[0][0]
-                elif self._shipper_hotspot_assignments.get(s.id):
-                    self._shipper_goals[s.id] = self._shipper_hotspot_assignments[s.id]
-                elif self.detector.is_surge and self.detector.predicted_hotspots:
-                    self._shipper_goals[s.id] = min(
-                        self.detector.predicted_hotspots,
-                        key=lambda hp: self._dist(s.position, hp)
-                    )
                 else:
                     self._shipper_goals[s.id] = s.position
 
