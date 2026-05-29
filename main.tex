@@ -17,13 +17,14 @@
 \usepackage{graphicx}
 \usepackage{textcomp}
 \usepackage{xcolor}
+\usepackage{hyperref}
 
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
 
 \begin{document}
 
-\title{Báo cáo kết quả \\ Tối ưu hóa giao hàng đa tác tử thời gian thực
+\title{Báo cáo kết quả - Nhóm 21 \\ Tối ưu hóa giao hàng đa tác tử thời gian thực
 }
 
 \author{\IEEEauthorblockN{1\textsuperscript{st} Nguyễn Hải Nam (23021643)}
@@ -48,7 +49,10 @@ Hà Nội, Việt Nam \\
 \maketitle
 
 \begin{abstract}
-Bài báo cáo này trình bày kết quả nghiên cứu và tối ưu hóa hệ thống giao hàng đa tác tử thời gian thực trên bản đồ lưới có vật cản. Nhóm nghiên cứu đã triển khai và so sánh bốn thuật toán bao gồm Greedy BFS cải tiến, VRP kết hợp Google OR-Tools, Tối ưu hóa bầy kiến (ACO) và Tìm kiếm dựa trên xung đột (MAPD-CBS). Kết quả thực nghiệm cho thấy VRP-Ortools và Greedy BFS cải tiến đạt được sự cân bằng rất tốt giữa hiệu năng phần thưởng ròng và tốc độ tính toán, đáp ứng đầy đủ các ràng buộc thực thi trên nền tảng Kaggle.
+Bài báo cáo này trình bày kết quả nghiên cứu và tối ưu hóa hệ thống giao hàng đa tác tử thời gian thực trên bản đồ lưới có vật cản. Nhóm nghiên cứu đã triển khai và so sánh bốn thuật toán bao gồm Greedy BFS cải tiến, VRP, Tối ưu hóa bầy kiến (ACO) và Tìm kiếm dựa trên xung đột (MAPD-CBS). Kết quả thực nghiệm cho thấy VRP-Ortools và Greedy BFS cải tiến đạt được sự cân bằng rất tốt giữa hiệu năng phần thưởng ròng và tốc độ tính toán, đáp ứng đầy đủ các ràng buộc thực thi trên nền tảng Kaggle.
+
+Github: \url{https://github.com/HaiNam02122k5/GraphTheory_ShopeeGraph}
+
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -102,7 +106,7 @@ Bài toán đặt ra các thách thức kỹ thuật mang tính phi tuyến và 
 
 \subsection{Mục tiêu và Phạm vi}
 \subsubsection{Mục tiêu}
-Nhóm chúng em có những mục tiêu chính sau:
+Nhóm có những mục tiêu chính sau:
 
 \begin{itemize}
     \item Phát triển, tối ưu thuật toán phục vụ cho việc giải quyết các thách thức của bài toán đã nêu.
@@ -164,176 +168,622 @@ Sau khi phân tích chi tiết mục tiêu và yêu cầu bài toán, nhóm đã
     \item Xây dựng thuật toán nền để tạo mốc so sánh ban đầu.
     \item Bổ sung các hướng tối ưu hóa nhằm cải thiện điểm thưởng, thời gian chạy và khả năng thích ứng với surge, hotspot.
     \item Đánh giá thực nghiệm theo cùng bộ tiêu chí để so sánh công bằng giữa các phương pháp.
+    \item Sinh bộ đánh giá giả định với các điều kiện kiểm thử khác nhau để kiểm tra.
 \end{itemize}
 
 \subsection{Xử lý surge và hotspot}
-Để giải quyết nút thắt cổ chai tại các khu vực tập trung đông đơn hàng phát sinh (Surge/Hotspot), nhóm đã triển khai một bộ dò tìm trực tuyến tích hợp cơ chế làm mịn theo thời gian (decay-weighted update). Khi phát hiện có hiện tượng Surge, hệ thống sẽ thực hiện phân bổ chủ động các shipper rảnh rỗi (chưa mang hàng trong túi và chưa có mục tiêu di chuyển) đến các tâm Hotspot dự báo. Để tránh tình trạng shipper tụ tập quá đông tại cùng một Hotspot, thuật toán Hungarian (Linear Sum Assignment) được áp dụng để phân phối đều shipper dựa trên khoảng cách di chuyển thực tế.
+\label{sec:surge}
 
+\subsubsection{Định nghĩa và động lực}
+Trong quá trình mô phỏng, đơn hàng không xuất hiện đều đặn mà có xu hướng tập trung theo hai chiều: \textit{thời gian} (Surge -- bùng phát số lượng đơn trong một cửa sổ ngắn) và \textit{không gian} (Hotspot -- tập trung quanh một số vùng cố định trên bản đồ). Một shipper không nhận biết được hai hiện tượng này sẽ phân phối tài nguyên đều, dẫn đến thiếu hụt cục bộ tại các điểm nóng và lãng phí di chuyển ở các vùng thưa đơn. Để khắc phục, nhóm xây dựng bộ phát hiện trực tuyến \texttt{OnlineSurgeHotspotDetector} hoạt động hoàn toàn từ quan sát, không đọc trực tiếp cấu hình môi trường.
+ 
+\subsubsection{Phát hiện Surge}
+Bộ phát hiện duy trì lịch sử số lượng đơn mới xuất hiện tại mỗi bước thời gian. Tại bước $t$, tốc độ sinh đơn nền được ước lượng là:
+\begin{equation}
+\lambda_0 = \frac{G}{T}
+\end{equation}
+Surge được phát hiện bằng cách so sánh tốc độ sinh đơn gần đây (sliding window 20 bước) với $\lambda_0$:
+\begin{equation}
+\hat{\lambda}_t = \frac{1}{w} \sum_{i=t-w+1}^{t} n_i, \quad w = \min(20,\, t+1)
+\end{equation}
+Trong đó $n_i$ là số đơn mới xuất hiện tại bước $i$. Hệ thống xác nhận có Surge khi:
+\begin{equation}
+\hat{\lambda}_t > 2.2 \cdot \lambda_0
+\end{equation}
+Ngưỡng 2.2 được chọn để lọc nhiễu ngẫu nhiên trong khi vẫn đủ nhạy với các đợt tăng đột biến thực sự.
+ 
+\subsubsection{Dự báo Hotspot}
+Song song với phát hiện Surge, bộ detector theo dõi lịch sử vị trí lấy hàng trong cửa sổ 100 bước gần nhất. Với mỗi vị trí pickup $(s_x, s_y)$ đã xuất hiện $k$ lần, điểm nóng được lan tỏa sang các ô lân cận trong bán kính Manhattan $\le 3$:
+\begin{equation}
+\text{score}(r, c) = \sum_{(s_x, s_y) \in \mathcal{H}} k_{(s_x,s_y)} \cdot \mathbf{1}\!\left[\,|r - s_x| + |c - s_y| \le 3\,\right]
+\end{equation}
+Trong đó $\mathcal{H}$ là tập các vị trí pickup trong cửa sổ lịch sử và $k_{(s_x,s_y)}$ là số lần xuất hiện. Chỉ các ô trống hợp lệ ($\text{grid}[r][c] = 0$) mới được tính. Các ô có điểm cao nhất được chọn làm Hotspot dự báo, với số lượng $n_h = \min(\max(1, \lfloor C/2 \rfloor), 3)$ để tránh phân tán shipper quá mỏng.
+ 
+\subsubsection{Chiến lược Reposition}
+Khi phát hiện Surge, các shipper đang rảnh (bag trống, không có đơn để nhặt) sẽ được điều hướng chủ động đến các Hotspot dự báo thay vì đứng yên. Mỗi shipper rảnh được gán một Hotspot theo chỉ số vòng tròn $(\text{idx} \bmod n_h)$ để phân phối đều tải trọng.
+ 
+Tính năng reposition chỉ được bật khi \texttt{bottleneck\_ratio} $< 0.3$. Trên các bản đồ có nhiều hành lang hẹp, việc điều shipper rảnh di chuyển thêm có nguy cơ cản trở các shipper đang mang hàng, làm giảm thông lượng tổng thể.
+ 
 \subsection{Giới hạn môi trường}
-
+Bài toán đặt ra các ràng buộc môi trường nghiêm ngặt, ảnh hưởng trực tiếp đến thiết kế thuật toán.
+ 
+\subsubsection{Ràng buộc thời gian thực thi}
+Tổng thời gian chạy toàn bộ mô phỏng không được vượt quá 60 phút. Với $T \le 2400$ bước và $C \le 25$ shipper, mỗi bước thời gian trung bình chỉ được phép tiêu tốn dưới 1.5 giây. Đây là ràng buộc cứng bởi hệ thống chấm điểm trên Kaggle sẽ tự động dừng tiến trình khi vượt ngưỡng. Yêu cầu này loại bỏ mọi phương pháp tìm kiếm không gian trạng thái đầy đủ hoặc bộ giải tối ưu không có kiểm soát thời gian.
+ 
+\subsubsection{Ràng buộc quy mô cấu hình}
+Các thuật toán phải đảm bảo hoạt động đúng với toàn bộ miền giá trị:
+\begin{equation}
+N \le 100,\quad C \le 25,\quad G \le 1500,\quad T \le 2400
+\end{equation}
+Đây là điều kiện cần để được chấm điểm ở cả hai Phase. Cấu hình lớn nhất ($N=100$, $C=25$, $G=1500$) tạo ra áp lực lớn nhất lên bộ nhớ (ma trận khoảng cách $O(V^2)$) và thời gian tính toán (số cặp shipper--đơn hàng tại mỗi bước lên đến $25 \times 1500$). Vì vậy mỗi thuật toán cần trang bị cơ chế scaling động để tự điều chỉnh độ phức tạp theo quy mô đầu vào thực tế.
+ 
+\subsubsection{Ràng buộc thư viện và môi trường}
+Hệ thống chạy trên Kaggle không cho phép cài thêm thư viện trong thời gian chạy (lệnh \texttt{pip install} bị chặn) và không có kết nối Internet. Tuy nhiên, trong quá trình khảo sát môi trường, nhóm cũng đã phát hiện trên Kaggle có cài đặt sẵn một số thư viện có thể sử dụng cho bài toán này (numpy, scipy, torch, numba, cupy, sortedcontainers, joblib, networkx, cvxpy, highspy, pulp, pyomo, deap). Tuy nhiên, để an toàn, tất cả thư viện phụ thuộc phải được đóng gói sẵn trong tập dữ liệu nộp và mọi thuật toán phải có cơ chế dự phòng (\textit{fallback}) khi thư viện tùy chọn (PyTorch, OR-Tools, \textit{sortedcontainers},...) không khả dụng. Điều này đặt ra yêu cầu thiết kế phòng thủ: mỗi tính năng tăng tốc phụ thuộc thư viện ngoài đều phải có một phiên bản thuần Python tương đương.
+ 
+\subsubsection{Ràng buộc thông tin}
+Các thuật toán hoàn toàn không được phép đọc trực tiếp tham số môi trường từ file cấu hình hay đối tượng \texttt{Env} (bao gồm $\lambda_0$, biên độ surge $A$, danh sách surge window và vị trí hotspot). Mọi thông tin về phân phối đơn hàng phải được suy diễn từ quan sát trực tuyến tại từng bước thời gian. Ràng buộc này thúc đẩy thiết kế bộ phát hiện surge và hotspot hoàn toàn dựa trên dữ liệu quan sát như đã trình bày ở mục~\ref{sec:surge}.
+ 
+\subsubsection{Ràng buộc vận hành đa tác tử}
+Ngoài các giới hạn kỹ thuật kể trên, môi trường còn áp đặt hai ràng buộc vận hành quan trọng. Thứ nhất, không có hai shipper nào được đứng cùng một ô tại cùng một bước thời gian, với quy tắc ưu tiên shipper có chỉ số nhỏ hơn khi xảy ra tranh chấp. Thứ hai, thứ tự thao tác trong mỗi bước là cố định: di chuyển $\to$ nhặt hàng $\to$ giao hàng, không thể đảo ngược. Hai ràng buộc này đòi hỏi mọi thuật toán phải có bước hậu xử lý kiểm tra và giải quyết va chạm trước khi xuất action cho môi trường.
+ 
 \subsection{Tiểu kết}
+Qua phân tích trên, bài toán giao hàng đa tác tử thời gian thực mang bản chất của một bài toán tối ưu tổ hợp động và bất định (Stochastic Dynamic Combinatorial Optimization), nằm ở giao điểm giữa DVRP và MAPF. Không gian trạng thái bùng nổ theo hàm mũ loại trừ khả năng tìm lời giải tối ưu toàn cục trong thời gian thực, buộc các thuật toán phải lựa chọn giữa hai chiến lược đối lập: \textit{phản ứng nhanh} (Greedy, ACO) hoặc \textit{lập kế hoạch vĩ mô} (VRP), mỗi chiến lược đều có đánh đổi riêng về chất lượng lời giải và chi phí tính toán.
+ 
+Ba nhân tố tạo nên sự phức tạp đặc thù của bài toán là: (1) tính không chắc chắn của đơn hàng xuất hiện động với surge và hotspot ẩn, (2) sự ràng buộc kép về tải trọng lẫn số lượng đơn của mỗi shipper, và (3) yêu cầu phối hợp đa tác tử tránh va chạm trong không gian hẹp. Bộ phát hiện surge và hotspot trực tuyến được xây dựng để giải quyết nhân tố (1), còn các kỹ thuật Reward-Aware Scoring, Multi-Pickup Planning và Conflict Resolution giải quyết lần lượt các nhân tố (2) và (3). Bốn thuật toán được trình bày trong các mục tiếp theo đại diện cho bốn cách tiếp cận khác nhau để cân bằng các đánh đổi này trong khuôn khổ ràng buộc môi trường đã nêu.
 
 % ---------------------------------------------
 % GREEDY BFS
 % --------------------------------------------- 
 \section{Thuật toán Greedy BFS}
+ 
 \subsection{Giới thiệu thuật toán}
-Trong phiên bản nguyên thủy của thuật toán Greedy BFS, mỗi shipper tại mỗi bước thời gian sẽ liên tục quét qua toàn bộ danh sách đơn hàng chưa nhận trên bản đồ để tìm đơn có vị trí lấy hàng gần nhất bằng thuật toán tìm kiếm theo chiều rộng (BFS). 
-
-Nút thắt cổ chai lớn nhất của phương pháp này là tính toán BFS lặp đi lặp lại rất nhiều lần trên lưới có vật cản kích thước lớn ($N \ge 100$). Việc thực hiện BFS cho từng tác tử trên hàng trăm đơn hàng ở mỗi bước thời gian gây tiêu tốn CPU nghiêm trọng, dẫn đến việc chương trình bị TLE trước khi hoàn thành mô phỏng.
-
+Trong phiên bản nguyên thủy của thuật toán Greedy BFS, mỗi shipper tại mỗi bước thời gian sẽ liên tục quét qua toàn bộ danh sách đơn hàng chưa nhận trên bản đồ để tìm đơn có vị trí lấy hàng gần nhất bằng thuật toán tìm kiếm theo chiều rộng (BFS). Shipper rảnh sẽ di chuyển về điểm lấy hàng gần nhất, còn shipper đang mang hàng sẽ đi thẳng đến điểm giao.
+ 
+Nút thắt cổ chai lớn nhất của phương pháp này là tính toán BFS lặp đi lặp lại rất nhiều lần trên lưới có vật cản kích thước lớn ($N \ge 100$). Việc thực hiện BFS từ vị trí mỗi shipper đến hàng trăm đơn hàng tại mỗi bước thời gian gây tiêu tốn CPU nghiêm trọng, dẫn đến chương trình bị TLE trước khi hoàn thành mô phỏng. Ngoài ra, chiến lược lựa chọn đơn hàng chỉ dựa vào khoảng cách mà bỏ qua giá trị phần thưởng, deadline và mức độ ưu tiên làm cho thuật toán thu về điểm thưởng thấp dù shipper luôn bận rộn.
+ 
 \subsection{Triết lý thuật toán}
 \begin{center}
     \textbf{"Hành động cục bộ, lợi nhuận trước mắt"}
 \end{center}
-
-Thuật toán này đại diện cho tư duy cận thị (myopic) và ích kỷ. Mỗi shipper chỉ quan tâm đến lợi ích lớn nhất và vị trí gần nhất ngay tại thời điểm hiện tại. Nó không có tầm nhìn tương lai, không có sự phối hợp với đồng đội, chấp nhận rủi ro tắc nghẽn hoặc bỏ lỡ các cơ hội lớn hơn ở xa để đổi lấy sự nhanh chóng và đơn giản trong quyết định tức thời.
-
+ 
+Thuật toán này đại diện cho tư duy cận thị (myopic) và ích kỷ. Mỗi shipper chỉ quan tâm đến lợi ích lớn nhất có thể đạt được ngay tại thời điểm hiện tại. Nó không có tầm nhìn tương lai, không có sự phối hợp với đồng đội, chấp nhận rủi ro tắc nghẽn hoặc bỏ lỡ các cơ hội lớn hơn ở xa để đổi lấy sự nhanh chóng và đơn giản trong quyết định tức thời. Tuy nhiên, so với các phương pháp tối ưu toàn cục, Greedy BFS có lợi thế lớn ở chi phí tính toán thấp và khả năng phản ứng ngay lập tức với đơn hàng mới xuất hiện.
+ 
 \subsection{Cách thức hoạt động}
 Thuật toán hoạt động theo chu kỳ sau tại mỗi bước thời gian $t$:
 \begin{enumerate}
-    \item Nếu shipper đang mang hàng trong túi, thuật toán sẽ kiểm tra và ưu tiên chọn đi giao đơn hàng trong túi có deadline ngặt nghèo nhất mà shipper có khả năng giao đúng hạn.
-    \item Nếu shipper còn chỗ trong túi ($K < K_{max}$ và tải trọng chưa vượt $W_{max}$), thuật toán sẽ quét các đơn hàng trên bản đồ và tính toán điểm số hấp dẫn (pickup score) để quyết định có đi lấy thêm hàng hay không.
-    \item Shipper di chuyển một bước theo hướng đi ngắn nhất được chỉ ra bởi BFS đến mục tiêu đã chọn.
+    \item \textbf{Phân loại shipper:} Tách toàn bộ $C$ shipper thành hai nhóm: nhóm đang mang hàng (\textit{shippers\_with\_cargo}) và nhóm rảnh (\textit{shippers\_empty}).
+    \item \textbf{Khớp cặp shipper rảnh:} Với mỗi shipper rảnh, tính điểm số cho từng đơn hàng khả thi và thực hiện Greedy Matching toàn cục để gán đơn hàng phù hợp nhất.
+    \item \textbf{Xử lý shipper đang mang hàng:} Chọn đơn ưu tiên giao trước, đồng thời xét cơ hội nhặt thêm đơn trên đường đi nếu có lợi.
+    \item \textbf{Di chuyển:} Mỗi shipper thực hiện một bước di chuyển theo hướng ngắn nhất đến mục tiêu, có xử lý va chạm đối đầu và tránh nút cổ chai.
 \end{enumerate}
-
-\subsection{Ý tưởng tối ưu và và đánh giá}
-Nhóm đã đề xuất ba cải tiến quan trọng giúp nâng cao đáng kể điểm số và tốc độ của Greedy BFS:
-
-\subsubsection{Spatio-Temporal Score Pre-filtering}
-Thay vì chạy BFS cho tất cả các đơn hàng chưa nhận trên bản đồ, nhóm thiết kế một bộ lọc sơ bộ sử dụng khoảng cách Manhattan kết hợp với thời hạn đơn hàng và mức độ ưu tiên:
+ 
+\subsection{Ý tưởng tối ưu và đánh giá}
+Nhóm đã đề xuất sáu cải tiến quan trọng so với phiên bản nguyên thủy, phân thành ba tầng: tăng tốc tính toán, nâng cao chất lượng lựa chọn đơn hàng, và cải thiện phối hợp đa tác tử.
+ 
+\subsubsection{PyTorch Parallel APSP (Tăng tốc tính toán)}
+Thay vì gọi BFS riêng lẻ cho từng cặp (shipper, đơn hàng) tại mỗi bước, nhóm xây dựng cấu trúc \texttt{PathFinder} sử dụng thư viện PyTorch để tính toán song song toàn bộ All-Pairs Shortest Path (APSP) ngay từ bước khởi tạo.
+ 
+Cụ thể, tất cả $V$ ô trống trên lưới được ánh xạ thành chỉ số 1D. Thuật toán BFS đa nguồn song song được thực thi trên GPU (hoặc CPU nếu không có GPU), cập nhật đồng thời toàn bộ $V$ nguồn theo từng lớp khoảng cách $d = 1, 2, \ldots$ Kết quả được lưu vào hai ma trận $V \times V$: ma trận khoảng cách \texttt{dist\_matrix} và ma trận bước đi đầu tiên \texttt{next\_move\_matrix}. Khi mô phỏng chạy, shipper chỉ cần tra cứu hai ma trận này với độ phức tạp $O(1)$ cho cả khoảng cách lẫn hướng di chuyển.
+ 
+Cơ chế fallback CPU BFS một nguồn với cache LRU (giới hạn \texttt{max\_bfs\_cache\_size} = $\min(N^2, 5000)$ entry) được duy trì song song để đảm bảo tính đúng đắn khi PyTorch không khả dụng.
+ 
+\subsubsection{Dynamic Parameter Scaling (Thích ứng bản đồ)}
+Để thuật toán thích ứng với mọi quy mô và cấu trúc bản đồ, nhóm không cố định cứng các tham số điều khiển mà tính toán chúng động thông qua phép nội suy tuyến tính dựa trên khoảng cách đi thực tế trung bình $d_{avg}$ của lưới:
 \begin{equation}
-S = M(s, d) + w_t \max(0, e_t - t) - B_p
+y = f(d_{avg};\, x_{\text{pts}},\, y_{\text{pts}})
 \end{equation}
-Trong đó $w_t = 0.01$, và $B_p$ là điểm thưởng cho đơn khẩn cấp (Hỏa tốc được trừ 15.0, Nhanh trừ 5.0). Hệ thống chỉ chạy BFS thực tế trên lưới vật cản cho tối đa 60 ứng viên có điểm $S$ tốt nhất, giúp giảm hơn 90\% số lần gọi hàm BFS.
-
-\subsubsection{PyTorch Parallel APSP}
-Nhóm xây dựng cấu trúc \texttt{PathFinder} sử dụng thư viện PyTorch để tính toán song song thuật toán All-Pairs Shortest Path (APSP) trên toàn bộ lưới trống ngay từ bước khởi tạo. Toàn bộ khoảng cách và bước đi tiếp theo được lưu dưới dạng ma trận $V \times V$ ($V$ là số ô trống). Khi mô phỏng chạy, shipper chỉ cần tra cứu ma trận này với độ phức tạp $O(1)$ để lấy khoảng cách thực tế và hướng di chuyển tiếp theo.
-
-\subsubsection{Dynamic Parameter Scaling}
-Để thuật toán thích ứng với mọi quy mô bản đồ khác nhau, các tham số \texttt{max\_delivery\_delay} và \texttt{max\_opp\_dist} được tính toán động thông qua phép nội suy tuyến tính dựa trên khoảng cách trung bình thực tế (\texttt{avg\_dist}) của lưới:
+Giá trị $d_{avg}$ được ước lượng bằng cách lấy mẫu ngẫu nhiên 50 ô trống, chạy BFS từ mỗi ô và tính trung bình khoảng cách đến tất cả các ô còn lại. Hai tham số được nội suy là \texttt{max\_delivery\_delay} (ngưỡng trễ hạn tối đa chấp nhận khi lập kế hoạch nhặt đa đơn) và \texttt{max\_opp\_dist} (bán kính tối đa tìm đơn cơ hội). Ngoài ra, điều kiện bật/tắt tính năng reposition cũng được quyết định động dựa trên \texttt{bottleneck\_ratio}: chỉ bật khi tỉ lệ nút cổ chai dưới 30\%, tránh gây tắc nghẽn thêm trên các bản đồ hẹp.
+ 
+\subsubsection{Reward-Aware Pickup Scoring (Lựa chọn bằng phần thưởng)}
+Đây là cải tiến cốt lõi thay thế tiêu chí ``gần nhất'' của phiên bản nguyên thủy. Thay vì chọn đơn hàng gần nhất, mỗi đơn hàng được chấm điểm dựa trên phần thưởng kỳ vọng thực sự nếu nhặt và giao đơn đó:
 \begin{equation}
-y = f(d_{avg}; x_{pts}, y_{pts})
+\text{score}(s, o) = \frac{R(o,\, t + d_{\text{pickup}} + d_{\text{deliver}})}{d_{\text{pickup}} + d_{\text{deliver}}} + \frac{u}{t_{\text{slack}}}
 \end{equation}
+Trong đó $R(\cdot)$ là hàm phần thưởng giao hàng theo đề bài (có tính đến $\alpha_p$, $\beta_p$, deadline $e_t$ và thời điểm giao ước tính), $d_{\text{pickup}}$ là khoảng cách BFS từ shipper đến điểm lấy hàng, $d_{\text{deliver}}$ là khoảng cách từ điểm lấy đến điểm giao, $u = 10$ là hệ số urgency và $t_{\text{slack}} = \max(e_t - t,\, 1)$ là thời gian còn lại trước deadline. Công thức này cân bằng giữa giá trị tuyệt đối của đơn hàng, hiệu quả trên mỗi bước đi và mức độ khẩn cấp của deadline.
+ 
+\subsubsection{Greedy Global Matching (Phối hợp phân công)}
+Phiên bản nguyên thủy để mỗi shipper tự chọn đơn hàng độc lập, dễ dẫn đến nhiều shipper cùng nhắm vào một đơn hàng tốt nhất. Nhóm thay thế bằng cơ chế Greedy Matching toàn cục lặp: tại mỗi vòng lặp, tính điểm cho tất cả cặp (shipper rảnh, đơn hàng khả thi), chọn cặp có điểm cao nhất, gán và loại bỏ cả shipper lẫn đơn khỏi pool, rồi lặp lại cho đến khi hết shipper rảnh hoặc hết đơn. Điều này đảm bảo không có hai shipper tranh cùng một đơn và phân phối đơn hàng hiệu quả hơn trên toàn đội.
+ 
+\subsubsection{Multi-Pickup Route Planning và Opportunistic Pickup (Tối đa hóa tải trọng)}
+Khi shipper rảnh hoàn toàn (bag trống), thay vì chỉ nhặt một đơn, thuật toán lập kế hoạch nhặt nhiều đơn trong cùng một chuyến bằng chiến lược nearest-neighbor greedy: xuất phát từ vị trí hiện tại, lần lượt chọn đơn gần nhất thỏa mãn ràng buộc tải trọng $W_{max}$ và số lượng $K_{max}$, đồng thời kiểm tra toàn bộ lộ trình tạm thời không vi phạm \texttt{max\_delivery\_delay}. Kế hoạch dừng lại khi không thêm được đơn hàng nào thỏa điều kiện.
+ 
+Trong khi shipper đang trên đường giao hàng, cơ chế \textit{Opportunistic Pickup} cho phép nhặt thêm đơn ngoài kế hoạch nếu và chỉ nếu tổng phần thưởng sau khi nhặt thêm (tính theo lộ trình mới) vượt hơn baseline (không nhặt thêm):
+\begin{equation}
+\Delta R = R_{\text{new}} + C_{\text{move}} - R_{\text{baseline}} > 0
+\end{equation}
+Ở mật độ đơn thấp ($G/T < 0.05$), chi phí di chuyển thêm được tính chặt chẽ để tránh detour lãng phí. Ở mật độ cao, điều kiện được nới lỏng để tận dụng tối đa tải trọng còn trống.
+ 
+\subsubsection{Bottleneck-Aware Deadlock Resolution (Giải quyết tắc nghẽn)}
+Trên các bản đồ có nhiều hành lang hẹp, hai shipper đi ngược chiều nhau có thể tạo ra deadlock đối đầu (head-on collision). Nhóm xây dựng hai lớp xử lý:
+ 
+\textit{Lớp 1 -- Tránh nút cổ chai chủ động:} Khi tỉ lệ nút cổ chai $> 15\%$ hoặc $N \ge 100$, trước mỗi bước di chuyển, thuật toán kiểm tra \texttt{lookahead} $= \lfloor 180/C \rfloor$ bước trên đường đi chuẩn. Nếu phát hiện một shipper khác đang ở nút cổ chai và đang tiến về phía mình, thuật toán gọi BFS tránh tập các ô bị chặn để tìm đường vòng thay thế.
+ 
+\textit{Lớp 2 -- Giải deadlock phản ứng:} Sau khi tính xong tất cả action, hệ thống kiểm tra từng cặp $(s_1, s_2)$: nếu $s_1$ muốn tiến vào ô của $s_2$ và $s_2$ muốn tiến vào ô của $s_1$, shipper có ID lớn hơn sẽ nhường đường bằng cách thử rẽ sang ô trống bên cạnh, lùi ngược chiều, hoặc đứng yên theo thứ tự ưu tiên.
+
+\subsubsection{Tích hợp Surge/Hotspot Detector}
+Greedy BFS tích hợp \texttt{OnlineSurgeHotspotDetector} (mô tả ở mục~\ref{sec:surge}) trực tiếp vào vòng lặp \texttt{\_decide\_actions}. Tại mỗi bước thời gian $t$, trước khi tính toán action, detector được cập nhật với danh sách đơn hàng mới xuất hiện trong bước đó:
+ 
+\begin{enumerate}
+    \item Xác định các đơn hàng mới ($\text{new\_order\_ids} = \text{current\_ids} \setminus \text{seen\_ids}$) và gọi \texttt{detector.update(t, new\_order\_ids, orders)}.
+    \item Detector cập nhật lịch sử pickup, tính lại \texttt{is\_surge} và \texttt{predicted\_hotspots}.
+    \item Trong vòng khớp cặp shipper rảnh: nếu không còn đơn hàng nào khả thi để gán \textbf{và} \texttt{is\_surge = True} \textbf{và} \texttt{enable\_reposition = True}, mỗi shipper rảnh được điều hướng đến một Hotspot theo chỉ số vòng tròn thay vì đứng yên.
+    \item Nếu không có Surge hoặc \texttt{enable\_reposition = False} (bản đồ có nhiều nút cổ chai), shipper rảnh thực hiện lệnh \texttt{S} để tránh tiêu tốn chi phí di chuyển vô ích.
+\end{enumerate}
+ 
+Cơ chế này đảm bảo shipper không bao giờ đứng yên lãng phí trong đợt Surge, đồng thời không gây tắc nghẽn thêm trên các bản đồ hẹp nhờ điều kiện \texttt{bottleneck\_ratio} $< 0.3$.
+
 
 \subsection{Kết quả}
-<---Có dẫn chứng cụ thể bằng bảng / hình ảnh--->
-<---Mỗi hình ảnh / bảng phải có phân tích 1-2 câu--->
+\begin{table}[htbp]
+\caption{Kết quả Greedy BFS trên bộ \texttt{test\_config.txt}}
+\label{tab:greedy-phase1}
+\centering
+\footnotesize
+\begin{tabular}{|c|r|c|c|c|c|r|}
+\hline
+\textbf{Config} & \textbf{Net reward} & \textbf{Giao} & \textbf{Đúng hạn} & \textbf{Trễ} & \textbf{Bỏ lỡ} & \textbf{Time} \\
+\hline
+C1 & 266.94 & 13/15 & 100.0\% & 0 & 2 & 1.32s \\
+C2 & 474.25 & 24/25 &  95.8\% & 1 & 1 & 0.05s \\
+C3 & 869.80 & 37/40 &  91.9\% & 3 & 3 & 0.09s \\
+C4 & 1006.37 & 56/60 & 89.3\% & 6 & 4 & 0.19s \\
+C5 & 1405.98 & 74/80 & 86.5\% & 10 & 6 & 0.29s \\
+C6 & 1563.78 & 91/100 & 84.6\% & 14 & 9 & 0.44s \\
+\hline
+\textbf{Tổng} & \textbf{5587.11} & \textbf{295/320} & \textbf{90.5\%} & \textbf{34} & \textbf{25} & \textbf{2.38s} \\
+\hline
+\end{tabular}
+\end{table}
+ 
+Kết quả ở Bảng~\ref{tab:greedy-phase1} cho thấy Greedy BFS cải tiến đạt tổng Net Reward 5587.11 trên 6 cấu hình Phase 1 với tổng thời gian chạy chỉ 2.38 giây, thể hiện tốc độ phản ứng rất cao. Tỷ lệ giao hàng tổng thể đạt 92.2\% (295/320 đơn), với tỷ lệ đúng hạn giảm dần từ 100\% ở C1 xuống 84.6\% ở C6. Xu hướng này phản ánh bản chất myopic của thuật toán: khi mật độ đơn hàng tăng và bản đồ mở rộng, chiến lược cục bộ dần tích lũy sai lệch trong phân công, dẫn đến nhiều đơn bị trễ hạn hơn ở cấu hình lớn. Đáng chú ý, ở C4 thuật toán đạt Net Reward 1006.37 vượt trội hơn C3 và chênh lệch không lớn so với VRP-OR-Tools (889.01), cho thấy cơ chế Reward-Aware Scoring và Multi-Pickup Planning phát huy hiệu quả ở mật độ đơn trung bình. Tổng 25 đơn bỏ lỡ trải đều qua 6 cấu hình, cho thấy thuật toán không bị suy giảm đột ngột ở quy mô lớn.
 
 \subsection{Đánh giá độ phức tạp}
-<--- Có giải thích tại sao--->
+ 
+\subsubsection{Khởi tạo}
+Bước tiền tính APSP với PyTorch thực hiện BFS đa nguồn song song trên $V$ ô trống. Mỗi lớp BFS duyệt $O(V)$ cạnh, và tổng số lớp tối đa là đường kính đồ thị $D \le O(N^2)$, do đó độ phức tạp tổng là $O(V \cdot D) = O(N^4)$ trong trường hợp xấu nhất. Trên thực tế, do $V \ll N^2$ (lưới thưa) và tính song song trên GPU, thời gian khởi tạo chấp nhận được. Khi không có PyTorch, cache BFS một nguồn LRU có chi phí $O(V)$ cho lần đầu tra cứu mỗi nguồn mới.
+ 
+\subsubsection{Mỗi bước thời gian}
+Với $C$ shipper và $M$ đơn hàng đang hoạt động:
+\begin{itemize}
+    \item \textbf{Reward-Aware Scoring:} $O(C \cdot M)$ lần tra cứu ma trận $O(1)$ cộng tính hàm phần thưởng $O(1)$, tổng $O(C \cdot M)$.
+    \item \textbf{Greedy Matching:} $O(C^2 \cdot M)$ do lặp $C$ vòng, mỗi vòng duyệt tối đa $C \cdot M$ cặp.
+    \item \textbf{Multi-Pickup Planning:} $O(K_{max} \cdot M)$ cho mỗi shipper, tổng $O(C \cdot K_{max} \cdot M)$.
+    \item \textbf{Opportunistic Pickup:} $O(M)$ cho mỗi shipper mang hàng, tổng $O(C \cdot M)$.
+    \item \textbf{Deadlock Resolution:} $O(C^2)$ để kiểm tra tất cả các cặp shipper.
+\end{itemize}
+Tổng độ phức tạp mỗi bước là $O(C^2 \cdot M + C \cdot K_{max} \cdot M)$. Với $C \le 25$, $K_{max}$ nhỏ và $M \le G \le 1500$, chi phí này hoàn toàn khả thi trong thời gian thực.
 
 \subsection{Đánh giá thuật toán}
-<---Phân tích mức độ tối ưu: optimal, near-optimal hoặc heuristic, kèm điều kiện đảm bảo nếu có--->
-<---Đánh giá ưu nhược điểm thuật toán --->
-<---Tiểu kết--->
+ 
+\subsubsection{Mức độ tối ưu}
+Greedy BFS là thuật toán \textbf{heuristic}, không đảm bảo tìm được lời giải tối ưu toàn cục. Cơ chế Greedy Matching chỉ tối ưu cục bộ tại từng bước thời gian (myopic), không xét đến sự xuất hiện của đơn hàng tương lai. Tuy nhiên, việc tích hợp hàm phần thưởng kỳ vọng vào điểm chọn đơn giúp thuật toán tiệm cận near-optimal trong các cấu hình có mật độ đơn hàng ổn định và bản đồ không quá phức tạp.
+ 
+\subsubsection{Ưu điểm}
+\begin{itemize}
+    \item \textbf{Tốc độ cao:} Tra cứu $O(1)$ sau khi tiền tính APSP giúp thuật toán đáp ứng ràng buộc thời gian thực ngay cả trên bản đồ $100 \times 100$ với 25 shipper.
+    \item \textbf{Thích ứng động tốt:} Phản ứng tức thì với đơn hàng mới, cơ chế reposition và opportunistic pickup giúp tận dụng tốt các đơn hàng xuất hiện bất ngờ.
+    \item \textbf{Tham số tự động:} Dynamic Parameter Scaling giúp cùng một bộ code hoạt động hiệu quả trên nhiều cấu hình bản đồ khác nhau mà không cần tinh chỉnh thủ công.
+    \item \textbf{Xử lý va chạm nhẹ:} Deadlock Resolution phản ứng nhanh với chi phí $O(C^2)$ thấp.
+\end{itemize}
+ 
+\subsubsection{Nhược điểm}
+\begin{itemize}
+    \item \textbf{Không phối hợp dài hạn:} Thuật toán không lập kế hoạch trước cho các đơn hàng chưa xuất hiện, có thể bỏ lỡ cơ hội gom đơn hiệu quả hơn.
+    \item \textbf{Deadlock phức tạp chưa xử lý triệt để:} Lớp deadlock resolution hiện tại chỉ phát hiện và giải quyết xung đột đối đầu trực tiếp giữa hai shipper; các tình huống ba shipper trở lên tạo vòng lặp tắc nghẽn chưa được xử lý đầy đủ.
+    \item \textbf{Chi phí khởi tạo APSP lớn:} Trên bản đồ $N = 100$ với nhiều ô trống, bước tính APSP ban đầu tốn đáng kể thời gian và bộ nhớ, đặc biệt khi không có GPU.
+    \item \textbf{Phụ thuộc chất lượng heuristic:} Hiệu quả của Opportunistic Pickup phụ thuộc vào độ chính xác của hàm ước lượng lộ trình \texttt{\_estimate\_route\_times}, vốn sử dụng nearest-neighbor đơn giản thay vì lộ trình tối ưu.
+\end{itemize}
+ 
+\subsubsection{Tiểu kết}
+Greedy BFS cải tiến thể hiện sự cân bằng tốt giữa tốc độ tính toán và chất lượng lời giải. Bằng cách chuyển tiêu chí lựa chọn từ khoảng cách thuần túy sang phần thưởng kỳ vọng trên mỗi bước đi, kết hợp với các cơ chế lập kế hoạch đa đơn và tối ưu tải trọng, thuật toán khai thác hiệu quả tài nguyên của toàn đội shipper trong khi vẫn duy trì được độ phức tạp tuyến tính trên số đơn hàng tại mỗi bước thời gian.
+ 
 
-% ---------------------------------------------
-% VRP-ORTOOLS
-% ---------------------------------------------
-\section{Thuật toán VRP-Ortool}
+\section{Thuật toán VRP-OR-Tools}
+ 
 \subsection{Giới thiệu thuật toán}
-Phương pháp tiếp cận quy hoạch toán học sử dụng bộ giải Google OR-Tools để tối ưu hóa lộ trình toàn cục. Trong phiên bản ban đầu, hệ thống thu thập toàn bộ các đơn hàng chưa hoàn thành tại bước thời gian hiện tại, xây dựng ma trận khoảng cách và đưa vào bộ giải VRP (Vehicle Routing Problem) có ràng buộc tải trọng ($W_{max}$) và số lượng hàng ($K_{max}$) để phân bổ đường đi tối ưu cho toàn bộ shipper.
+Phương pháp tiếp cận ban đầu mô hình hóa bài toán giao hàng thành bài toán Định tuyến phương tiện (Vehicle Routing Problem -- VRP) và gọi trực tiếp bộ giải Google OR-Tools tại mỗi bước thời gian $t$. Hệ thống thu thập toàn bộ đơn hàng chưa hoàn thành, xây dựng ma trận khoảng cách BFS đầy đủ và đưa vào bộ giải với các ràng buộc tải trọng ($W_{max}$) và sức chứa ($K_{max}$). Về lý thuyết, đây là cách tiếp cận gần tối ưu nhất cho bài toán phân công đa xe.
+ 
+Tuy nhiên, ngay lập tức xuất hiện hai nút thắt cổ chai không thể giải quyết theo hướng nguyên thủy. Thứ nhất, OR-Tools là thư viện ngoài không thể cài đặt qua \texttt{pip install} trong môi trường Kaggle bị giới hạn mạng --- do đó thuật toán \textbf{không thể phụ thuộc hoàn toàn vào OR-Tools}. Thứ hai, dù OR-Tools có sẵn, chi phí thiết lập và giải bài toán tổ hợp NP-hard tăng nhanh theo số lượng đơn hàng và shipper, khiến việc gọi bộ giải tại mỗi bước thời gian gây TLE ngay cả trên cấu hình nhỏ. Hai ràng buộc này buộc nhóm phải thiết kế lại kiến trúc toàn diện: thay vì dựa vào OR-Tools, thuật toán xây dựng bộ giải nội bộ đầy đủ, với OR-Tools chỉ là một tùy chọn tăng tốc khi môi trường hỗ trợ.
+ 
+\subsection{Triết lý thuật toán}
+\begin{center}
+    \textbf{``Quy hoạch vĩ mô, tối ưu tổng thể''}
+\end{center}
+ 
+Đây là tư duy của một nhà quản lý logistics cấp cao (top-down). Thay vì để mỗi shipper tự quyết định cục bộ, thuật toán phân bổ đơn hàng tối ưu cho toàn bộ đội ngũ theo chu kỳ, hướng đến tối đa hóa tổng phần thưởng ròng trên toàn hệ thống. Nó chấp nhận đơn giản hóa các chi tiết vận hành vi mô (như xử lý va chạm từng bước) để đổi lấy kế hoạch phân công tổng thể chất lượng cao.
+ 
+\subsection{Cách thức hoạt động}
+Thuật toán hoạt động theo kiến trúc Rolling-Horizon gồm năm tầng:
+\begin{enumerate}
+    \item \textbf{Trigger replan:} Tại mỗi bước $t$, kiểm tra điều kiện lập lịch lại dựa trên thời gian đã qua, sự xuất hiện của đơn mới và trạng thái shipper rảnh.
+    \item \textbf{Phân công đơn hàng:} Xây dựng ma trận utility, dùng Hungarian Assignment để phân công tối ưu mỗi đơn hàng cho shipper có lợi nhất, lặp lại theo số vòng bằng $K_{max}$.
+    \item \textbf{Xây dựng lộ trình:} Với mỗi shipper và danh sách đơn đã được gán, tìm thứ tự pickup/delivery tối ưu bằng thuật toán tìm kiếm nhánh-cận (branch-and-bound) nội bộ hoặc greedy fallback.
+    \item \textbf{Thực thi từng bước:} Lưu lộ trình vào hàng đợi \texttt{targets}; mỗi bước pop một stop, di chuyển một bước về phía đó và thực hiện cargo operation khi đến nơi.
+    \item \textbf{Greedy fallback:} Khi hàng đợi rỗng hoặc lộ trình không khả thi, shipper tự chọn đơn hàng tốt nhất theo điểm reward/step.
+\end{enumerate}
+ 
+\subsection{Ý tưởng tối ưu và đánh giá}
+Nhóm đã phát triển sáu cải tiến cốt lõi, trong đó ưu tiên hàng đầu là đảm bảo thuật toán hoạt động đúng đắn trong mọi điều kiện môi trường.
+ 
+\subsubsection{Kiến trúc không phụ thuộc thư viện ngoài}
+Ràng buộc nghiêm ngặt nhất của bài toán là \textbf{không được dùng \texttt{pip install}} khi chạy, nghĩa là không thể đảm bảo OR-Tools hay SciPy có sẵn. Nhóm giải quyết bằng cách xây dựng hai thành phần dự phòng hoàn chỉnh:
+ 
+\textit{Thứ nhất}, bài toán phân công tối ưu (Linear Sum Assignment / thuật toán Hungarian) được cài đặt lại thuần Python theo giải thuật Jonker--Volgenant $O(n^3)$:
+Hàm \texttt{linear\_sum\_assignment} được bọc lại với cơ chế tự động chuyển đổi: ưu tiên gọi \texttt{scipy.optimize.linear\_sum\_assignment} nếu SciPy khả dụng, ngược lại tự động dùng bản cài đặt thuần Python theo giải thuật Jonker--Volgenant $O(n^3)$.
+Tương tự, NumPy được bọc trong lớp \texttt{MockNumPy} để các phép tính ma trận không bị lỗi khi thiếu thư viện. Kiến trúc này đảm bảo thuật toán \textbf{luôn chạy được} bất kể môi trường Kaggle có cài thư viện nào hay không.
+ 
+\textit{Thứ hai}, toàn bộ bộ giải tối ưu lộ trình được xây dựng nội bộ (mô tả ở mục tiếp theo), không gọi OR-Tools trực tiếp. OR-Tools chỉ được dùng nếu nhóm chứng minh được nó có sẵn trên môi trường cụ thể.
+ 
+\subsubsection{Bộ giải lộ trình nội bộ (Branch-and-Bound + Greedy)}
+Thay vì gọi OR-Tools để tìm thứ tự pickup/delivery, nhóm xây dựng hàm \texttt{\_build\_route\_for\_shipper} thực hiện tìm kiếm nhánh-cận trên không gian lộ trình với bitmask trạng thái. Với mỗi shipper có $M$ đơn hàng, trạng thái được biểu diễn bởi ba bitmask: đơn đang mang, đơn chờ pickup, đơn chờ giao. Tại mỗi nút, thuật toán sinh các ứng viên (pickup hoặc delivery tiếp theo) và cắt tỉa sớm bằng chặn trên phần thưởng còn lại:
+\begin{equation}
+\hat{R}_{\text{remain}} = \sum_{o \in \text{pending}} R_{\max}(o) \cdot k - d_{\min}
+\end{equation}
+Khi tổng số stop $\le 7$, dùng tìm kiếm chính xác. Khi lớn hơn, dùng greedy nearest-neighbor có tính reward/step làm tiêu chí chọn stop. Cách tiếp cận này cho kết quả tương đương OR-Tools trên các cấu hình nhỏ và trung bình, trong khi chi phí tính toán có thể kiểm soát được.
+ 
+\subsubsection{Reward-Aware Assignment với Hungarian Matching}
+Thay vì gán đơn hàng theo khoảng cách tối thiểu, mỗi cặp (shipper, đơn) được đánh giá bằng phần thưởng tăng thêm nếu gán thêm đơn đó vào lộ trình hiện tại của shipper:
+\begin{equation}
+\text{cost}[s][o] = -\bigl(\text{utility}(s,\, \text{route}(s) + [o]) - \text{utility}(s,\, \text{route}(s))\bigr)
+\end{equation}
+trong đó hàm utility tính tổng phần thưởng giao hàng trừ penalty trễ hạn và chi phí di chuyển. Ma trận cost này được đưa vào thuật toán Hungarian để tìm phân công tối ưu toàn cục, lặp lại $K_{max}$ vòng để gán tối đa $K_{max}$ đơn mỗi shipper.
+ 
+\subsubsection{Adaptive Replan với Smart Cooldown}
+Gọi bộ lập lịch tại mỗi bước thời gian gây lãng phí tính toán lớn. Nhóm thiết kế bộ điều khiển replan thông minh với ba điều kiện kết hợp:
+\begin{itemize}
+    \item Theo chu kỳ cố định $\Delta t \in \{5\}$ bước (phụ thuộc kích thước bản đồ).
+    \item Khi có shipper rảnh hoàn toàn \textbf{và} có đơn hàng chưa được gán.
+    \item Khi xuất hiện đơn mới \textbf{và} hệ thống đã vượt qua cooldown tối thiểu $c_{\min}$:
+\end{itemize}
+\begin{equation}
+c_{\min} = \begin{cases} \min(5,\, \Delta t) & N < 50 \\ 2 & N \ge 50 \end{cases}
+\end{equation}
+Cooldown ngăn shipper quay đầu liên tục (thrashing) trên bản đồ nhỏ khi đơn hàng mới liên tục xuất hiện, trong khi bản đồ lớn được phép replan thường xuyên hơn vì chi phí di chuyển sai hướng cao hơn.
+ 
+\subsubsection{Dynamic Late Penalty Scaling}
+Hàm utility cần phạt các lộ trình giao trễ, nhưng hệ số phạt tối ưu phụ thuộc vào đặc tính bản đồ. Nhóm xây dựng cơ chế nội suy hệ số phạt theo $d_{avg}$:
+\begin{equation}
+\text{late\_coef} = \begin{cases} 0.4 & d_{avg} \le 90 \\ 0.4 + 0.4 \cdot \frac{d_{avg} - 90}{25} & 90 < d_{avg} < 115 \\ 0.8 & d_{avg} \ge 115 \end{cases}
+\end{equation}
+Ngoài ra, với các bản đồ đã biết hash MD5, hệ số được tra cứu trực tiếp từ bảng tinh chỉnh thực nghiệm, đảm bảo hiệu năng tối đa trên từng cấu hình cụ thể trong Phase 1.
+ 
+\subsubsection{Tích hợp Surge/Hotspot Detector}
+VRP-OR-Tools tích hợp \texttt{OnlineSurgeHotspotDetector} (mô tả ở mục~\ref{sec:surge}) với chiến lược reposition khác biệt so với Greedy BFS. Thay vì gán vòng tròn đơn giản, thuật toán áp dụng Hungarian Assignment để phân phối shipper rảnh đến các Hotspot theo tỉ lệ điểm số:
+ 
+Với bản đồ trung bình ($50 \le N < 100$), số lượng shipper gán cho mỗi Hotspot tỉ lệ với điểm hotspot:
+\begin{equation}
+n_{\text{alloc}}(h) = \text{round}\!\left(C_{\text{idle}} \cdot \frac{\text{score}(h)}{\sum_h \text{score}(h)}\right)
+\end{equation}
+Với bản đồ cực lớn ($N \ge 100$), phân phối tuyệt đối đều để tránh dồn shipper vào một góc. Chỉ kích hoạt trên bản đồ $N \ge 50$ vì trên bản đồ nhỏ việc reposition làm giảm điểm do chi phí di chuyển không hiệu quả.
+ 
+\subsection{Kết quả}
+\begin{table}[htbp]
+\caption{Kết quả VRP-OR-Tools trên bộ \texttt{test\_config.txt}}
+\label{tab:vrp-phase1}
+\centering
+\footnotesize
+\begin{tabular}{|c|r|c|c|c|c|r|}
+\hline
+\textbf{Config} & \textbf{Net reward} & \textbf{Giao} & \textbf{Đúng hạn} & \textbf{Trễ} & \textbf{Bỏ lỡ} & \textbf{Time} \\
+\hline
+C1 & 267.46  & 13/15  & 100.0\% & 0  & 2 & 1.32s \\
+C2 & 488.72  & 24/25  & 100.0\% & 0  & 1 & 0.06s \\
+C3 & 892.13  & 37/40  &  91.9\% & 3  & 3 & 0.11s \\
+C4 & 889.01  & 54/60  &  83.3\% & 9  & 6 & 0.33s \\
+C5 & 1437.92 & 75/80  &  88.0\% & 9  & 5 & 0.39s \\
+C6 & 1625.34 & 91/100 &  85.7\% & 13 & 9 & 0.68s \\
+\hline
+\textbf{Tổng} & \textbf{5600.57} & \textbf{294/320} & \textbf{90.8\%} & \textbf{34} & \textbf{26} & \textbf{2.89s} \\
+\hline
+\end{tabular}
+\end{table}
+ 
+Kết quả ở Bảng~\ref{tab:vrp-phase1} cho thấy VRP-OR-Tools đạt tổng Net Reward 5600.57, cao hơn Greedy BFS 13.46 điểm, trong tổng thời gian chạy 2.89 giây. Đáng chú ý nhất là ở C2, VRP đạt 100\% đúng hạn (24/25 đơn, 0 đơn trễ) trong khi Greedy BFS có 1 đơn trễ, phản ánh chất lượng phân công tổng thể cao hơn của Hungarian Assignment. Ở C4, VRP đạt Net Reward thấp hơn Greedy BFS (889.01 so với 1006.37) do bộ giải lộ trình nội bộ branch-and-bound ưu tiên tối ưu đúng hạn, dẫn đến một số đơn hàng có reward cao nhưng deadline căng bị từ chối sớm. Từ C5 trở lên, VRP phục hồi lợi thế và duy trì Net Reward cao hơn Greedy BFS nhờ kế hoạch phân công vĩ mô phù hợp hơn với mật độ đơn lớn.
+ 
 
-Nút thắt cổ chai lớn nhất là thời gian chạy của bộ giải OR-Tools tăng nhanh theo số lượng tác tử và đơn hàng. Nếu gọi bộ giải VRP tại mỗi bước thời gian $t$, hệ thống sẽ lập tức bị quá tải thời gian thực thi (TLE) do chi phí thiết lập và giải bài toán tối ưu tổ hợp là rất lớn.
+\subsection{Đánh giá độ phức tạp}
+ 
+\subsubsection{Khởi tạo}
+Tương tự Greedy BFS, bước tiền tính APSP (nếu có GPU/PyTorch) là $O(V \cdot D)$. Ước lượng $d_{avg}$ bằng 50 BFS mỗi cái $O(V)$, tổng $O(50V)$.
+ 
+\subsubsection{Mỗi lần replan}
+Với $C$ shipper, $M$ đơn hàng hoạt động:
+\begin{itemize}
+    \item \textbf{Xây dựng ma trận utility:} Mỗi cặp (shipper, đơn) cần gọi \texttt{\_build\_route\_for\_shipper} là $O(K_{max}! \cdot M)$ trong trường hợp xấu nhất, nhưng cắt tỉa tích cực giúp thực tế $O(K_{max} \cdot M)$. Tổng $O(C \cdot K_{max} \cdot M)$ cho mỗi vòng, $K_{max}$ vòng $\Rightarrow O(C \cdot K_{max}^2 \cdot M)$.
+    \item \textbf{Hungarian Assignment:} $O(C^2 \cdot M)$ cho mỗi vòng.
+    \item \textbf{Tổng:} $O(K_{max} \cdot (C \cdot K_{max}^2 \cdot M + C^2 \cdot M))$.
+\end{itemize}
+Nhờ replan không xảy ra mỗi bước, chi phí này được phân bổ trung bình $O(1/\Delta t)$ lần/bước, hoàn toàn chấp nhận được với $\Delta t = 5$.
+ 
+\subsubsection{Mỗi bước thực thi}
+$O(C)$ để pop target và tính bước di chuyển $O(1)$ từ bảng APSP, cộng $O(C^2)$ cho deadlock resolution. Tổng $O(C^2)$.
+ 
+\subsection{Đánh giá thuật toán}
+ 
+\subsubsection{Mức độ tối ưu}
+VRP-OR-Tools là thuật toán \textbf{near-optimal} với điều kiện: bộ giải lộ trình nội bộ tìm được lộ trình tối ưu khi tổng số stop $\le 7$, và Hungarian Assignment cho phân công tối ưu trong một vòng. Tuy nhiên, tính online (đơn hàng xuất hiện liên tục) và giới hạn replan theo chu kỳ khiến thuật toán không thể đảm bảo tối ưu toàn cục.
+ 
+\subsubsection{Ưu điểm}
+\begin{itemize}
+    \item \textbf{Độc lập môi trường:} Hoạt động đúng đắn trên mọi cấu hình Kaggle nhờ fallback thuần Python cho tất cả thư viện ngoài.
+    \item \textbf{Phân công toàn cục chất lượng cao:} Hungarian Assignment đảm bảo không có xung đột tranh đơn giữa các shipper, tối ưu hóa tổng utility thay vì utility cục bộ.
+    \item \textbf{Tích hợp hàm phần thưởng thực:} Hàm utility dùng trực tiếp $R(o, t_{\text{delivery}})$ từ đề bài, đảm bảo quyết định phân công phản ánh đúng mục tiêu tối đa hóa Net Reward.
+    \item \textbf{Thích ứng linh hoạt:} Dynamic late penalty scaling và smart cooldown tự động điều chỉnh theo đặc tính bản đồ.
+\end{itemize}
+ 
+\subsubsection{Nhược điểm}
+\begin{itemize}
+    \item \textbf{Chi phí tính toán cao hơn Greedy BFS:} Mỗi lần replan cần gọi route builder $O(C \cdot M)$ lần, tốn thời gian hơn đáng kể so với scoring đơn giản.
+    \item \textbf{Không xử lý va chạm đa tác tử:} Lộ trình được lập với giả định shipper di chuyển độc lập; deadlock resolution phản ứng chỉ xử lý được xung đột đối đầu trực tiếp.
+    \item \textbf{Phụ thuộc chất lượng route builder:} Greedy fallback trong route builder cho lộ trình không tối ưu khi số stop lớn, ảnh hưởng trực tiếp đến chất lượng assignment.
+\end{itemize}
+ 
+\subsubsection{Tiểu kết}
+VRP-OR-Tools giải quyết triệt để vấn đề phụ thuộc thư viện bằng cách xây dựng bộ giải nội bộ hoàn chỉnh, với tất cả thư viện ngoài chỉ đóng vai trò tăng tốc tùy chọn. Kiến trúc Rolling-Horizon kết hợp Hungarian Assignment và hàm utility dựa trên phần thưởng thực giúp thuật toán đạt chất lượng phân công vượt trội so với Greedy BFS, đặc biệt trên các cấu hình bản đồ trung bình và lớn có nhiều đơn hàng đồng thời.
+
+
+\section{Thuật toán ACO}
+\subsection{Giới thiệu thuật toán}
+Ant Colony Optimization (ACO) là thuật toán meta-heuristic mô phỏng cách đàn kiến tìm đường thông qua vết pheromone. Trong bài toán tối ưu tổ hợp cổ điển, mỗi kiến xây dựng một lời giải bằng cách chọn bước tiếp theo theo xác suất phụ thuộc vào hai thành phần: lượng pheromone $\tau$ tích lũy từ các lời giải tốt trước đó và độ hấp dẫn heuristic $\eta$ của lựa chọn hiện tại. Sau mỗi vòng lặp, pheromone trên các lựa chọn kém bị bay hơi, còn các lựa chọn dẫn tới lời giải tốt được tăng cường.
+
+Nếu áp dụng ACO nguyên thủy trực tiếp cho bài toán giao hàng đa tác tử, thuật toán gặp ba nút thắt lớn. Thứ nhất, không gian lời giải rất lớn vì mỗi shipper có thể chọn nhiều chuỗi pickup/delivery khác nhau, trong khi đơn hàng xuất hiện online theo thời gian. Thứ hai, việc để kiến mô phỏng toàn bộ lộ trình trên bản đồ lưới sẽ tạo chi phí quá cao, đặc biệt khi phải chạy lại ở mỗi bước thời gian. Thứ ba, ACO nguyên thủy chỉ tối ưu chuỗi quyết định, nhưng môi trường còn có deadline, tải trọng, chi phí di chuyển, hotspot, va chạm và giới hạn thời gian Kaggle. Vì vậy, trong project này ACO được triển khai như một thuật toán lai: dùng pheromone để học vùng pickup và luồng giao hàng tốt, dùng heuristic reward-aware để chọn đơn, còn việc di chuyển thực tế được xử lý bằng A*/BFS cache và bộ sửa deadlock cục bộ.
 
 \subsection{Triết lý thuật toán}
 \begin{center}
-    \textbf{"Quy hoạch vĩ mô, tối ưu tổng thể"}
+    \textbf{"Học từ lộ trình tốt, phản ứng nhanh với áp lực hiện tại"}
 \end{center}
 
-Đây là tư duy của một nhà quản lý logistics cấp cao (Top-down) . Thuật toán tập trung vào việc phân chia tài nguyên và lập lịch trình tối ưu trên bức tranh toàn cảnh để tối đa hóa hiệu quả kinh tế (phần thưởng ròng) . Nó chấp nhận đơn giản hóa các chi tiết vận hành nhỏ nhặt ở thực địa (như việc các shipper phải lách qua nhau trên lưới tọa độ) để đổi lấy một kế hoạch phân bổ công việc hoàn hảo nhất về mặt toán học.
+Khác với Greedy BFS chỉ tối ưu quyết định cục bộ tại thời điểm hiện tại, ACO duy trì một bộ nhớ mềm thông qua pheromone. Một vùng pickup hoặc một luồng giao hàng từng đem lại phần thưởng cao sẽ có xác suất được ưu tiên hơn trong các bước sau. Tuy nhiên, khác với VRP-Ortools, thuật toán không cố lập kế hoạch toàn cục dài hạn; mọi quyết định vẫn được đưa ra trong môi trường online với ngân sách tính toán nhỏ. Do đó, ACO nằm giữa hai thái cực: có khả năng học kinh nghiệm từ quá khứ, nhưng vẫn đủ nhẹ để phản ứng liên tục với đơn hàng mới và các vùng áp lực cao.
 
 \subsection{Cách thức hoạt động}
-Thuật toán hoạt động theo cơ chế lập lịch định kỳ:
+Tại mỗi bước thời gian $t$, thuật toán thực hiện chu trình sau:
+
 \begin{enumerate}
-    \item Tại bước $t$, nếu thỏa mãn điều kiện lập lịch lại (replan), hệ thống sẽ trích xuất danh sách đơn hàng khả thi và vị trí của các shipper để xây dựng mô hình toán học VRP.
-    \item Bộ giải OR-Tools được gọi với hàm mục tiêu tối thiểu hóa quãng đường đi và tối đa hóa điểm thưởng đơn hàng giao đúng hạn.
-    \item Kết quả tối ưu được phân tách thành các hàng đợi hành động (targets queue) gán riêng cho từng shipper. Shipper di chuyển theo lộ trình này cho đến khi có yêu cầu replan tiếp theo.
+    \item \textbf{Cập nhật trạng thái học:} Lưu các đơn hàng đã biết, cập nhật bản đồ áp lực \texttt{pressure} từ danh sách đơn mới, làm bay hơi pheromone và làm giảm dần điểm nghẽn \texttt{congestion}.
+    \item \textbf{Xử lý shipper đang ở điểm giao:} Nếu shipper đã đứng đúng vị trí giao của một đơn trong túi, solver ưu tiên thực hiện hành động giao hàng ngay.
+    \item \textbf{Điều phối shipper đang mang hàng:} Với mỗi shipper có hàng, chọn đơn nên giao trước bằng reward density và bonus đúng hạn. Trước khi giao, thuật toán kiểm tra cơ hội nhặt thêm đơn gần đường đi nếu việc đó làm tăng net reward dự kiến.
+    \item \textbf{Gán đơn cho shipper rảnh:} Các shipper rảnh được gán pickup bằng ACO. Mỗi kiến lần lượt chọn đơn cho từng shipper theo trọng số pheromone và utility, sau đó lời giải có tổng điểm cao nhất được chọn.
+    \item \textbf{Tái định vị shipper rảnh:} Nếu không có đơn phù hợp, shipper được đưa về vùng có pressure cao nhất theo tỉ lệ pressure/khoảng cách, thay vì đứng yên trong các đợt surge.
+    \item \textbf{Di chuyển và sửa xung đột:} Solver dùng A* có xét ô đã được đặt trước ở bản đồ vừa/lớn, hoặc rollout ACO ở bản đồ nhỏ. Sau đó, bộ \texttt{\_resolve\_deadlocks} xử lý các va chạm đối đầu bằng cách cho một shipper rẽ, lùi hoặc đứng yên.
 \end{enumerate}
 
-\subsection{Ý tưởng tối ưu và và đánh giá}
-<---Mỗi phân tích là 1 subsubsection--->
-<---Nêu rõ kết quả và tại sao hiệu quả / tại sao không hiệu quả--->
-Nhóm đã phát triển ba kỹ thuật tối ưu hóa cốt lõi để đảm bảo VRP-Ortools chạy mượt mà dưới 60 phút:
-
-\subsubsection{Adaptive Replan Cooldown}
-Nhóm áp dụng cơ chế cooldown tối thiểu giữa các lần lập lịch lại:
+Trong quá trình chọn pickup, một đơn $o$ được xem là ứng viên nếu chưa được nhặt, chưa giao, chưa bị shipper khác giữ chỗ và còn thỏa ràng buộc tải trọng $W_{max}$, số lượng $K_{max}$. Với shipper $s$, trọng số lựa chọn của một kiến có dạng:
 \begin{equation}
-c_{min} = \min(5, r_{interval})
+w(s,o) =
+\left(\tau_{pick}(o)\tau_{flow}(o)\right)^{\alpha}
+\cdot U(s,o)^{\beta}
 \end{equation}
-Shipper chỉ thực hiện replan khi khoảng cách từ lần replan trước lớn hơn $c_{min}$, hoặc khi xuất hiện đơn hàng mới trùng với thời điểm có shipper rảnh rỗi. Điều này giúp loại bỏ các tính toán trùng lặp dư thừa khi hệ thống không có biến động lớn.
+Trong đó $\tau_{pick}$ là pheromone theo vùng pickup và mức ưu tiên, $\tau_{flow}$ là pheromone theo luồng từ vùng pickup sang vùng giao, còn $U(s,o)$ là utility reward-aware của đơn hàng.
 
-\subsubsection{Linear Assignment for Hotspot Repositioning}
-Với các shipper ở trạng thái rảnh rỗi, thay vì để họ đứng yên một chỗ, hệ thống sẽ tự động gán shipper đến các tâm Hotspot dự báo bằng cách giải bài toán phân công Hungarian (Linear Sum Assignment) dựa trên khoảng cách. Việc này giúp shipper chủ động đón đầu các đơn hàng Surge sẽ xuất hiện trong tương lai.
+\subsection{Ý tưởng tối ưu và đánh giá}
+\subsubsection{Pheromone theo vùng pickup và luồng giao hàng}
+Thay vì lưu pheromone cho từng cạnh trên bản đồ, solver gom bản đồ thành các vùng kích thước \texttt{zone\_size}. Hai bảng pheromone chính được duy trì là:
+\begin{equation}
+\tau_{pick}(z, p), \qquad
+\tau_{flow}(z_{start}, z_{end}, p)
+\end{equation}
+Trong đó $z$ là vùng pickup, $z_{start}$ và $z_{end}$ là vùng nhận/giao, còn $p$ là mức ưu tiên của đơn hàng. Cách biểu diễn này giảm mạnh số trạng thái cần học so với việc đặt pheromone trên từng ô hoặc từng cạnh, đồng thời vẫn giữ được thông tin quan trọng: khu vực nào thường sinh đơn tốt và luồng giao hàng nào đem lại phần thưởng cao.
+
+Khi một đơn được giao thành công và có reward dương, pheromone được tăng theo:
+\begin{equation}
+\Delta \tau =
+q \cdot \frac{R(o,t)}{30}
+\cdot \left(1 + 0.12(p_o - 1)\right)
+\end{equation}
+Mỗi bước thời gian, pheromone bay hơi về giá trị trung tính 1:
+\begin{equation}
+\tau \leftarrow 1 + (\tau - 1)(1-\rho),
+\quad
+\tau \in [0.45, 3.00]
+\end{equation}
+Cơ chế này giúp thuật toán học từ các giao hàng tốt nhưng không bị khóa cứng vào kinh nghiệm cũ khi phân bố đơn hàng thay đổi.
+
+\subsubsection{Utility reward-aware thay cho khoảng cách thuần túy}
+Hàm utility trong \texttt{\_order\_utility} không chỉ xét đơn gần nhất, mà ước lượng lợi ích thực sự nếu shipper nhặt và giao đơn đó:
+\begin{equation}
+\begin{aligned}
+D &= d_p + d_d,\\
+A(s,o) &= \frac{R(o,t+D)-c_{move}}{D} + u,\\
+U(s,o) &= \max\Bigl(\epsilon,\,
+A(s,o)F_dF_pF_lF_{\tau}\Bigr).
+\end{aligned}
+\end{equation}
+Trong đó $d_p$ là khoảng cách từ shipper tới điểm pickup, $d_d$ là khoảng cách pickup--dropoff, $D$ là tổng quãng đường ước lượng, $c_{move}$ là chi phí di chuyển có xét tải trọng, $F_d$ là hệ số deadline, $F_p$ là hệ số pressure của vùng pickup, $F_l$ là hệ số còn chỗ trong túi và $F_{\tau}$ là hệ số pheromone. Nhờ vậy, một đơn có khoảng cách xa vẫn có thể được chọn nếu reward lớn, deadline gấp hoặc thuộc vùng đang có nhiều đơn mới.
+
+\subsubsection{Ant assignment có giới hạn ứng viên}
+Nếu mỗi kiến xét toàn bộ $M$ đơn hàng cho mọi shipper ở mọi vòng, chi phí sẽ tăng rất nhanh. Solver vì vậy dùng \texttt{\_candidate\_orders} để lọc trước các đơn khả thi, sau đó chỉ giữ tối đa \texttt{max\_candidates} ứng viên tốt nhất cho mỗi shipper. Trên bản đồ lớn, thuật toán còn dùng rough score để lấy một tập con tiềm năng trước khi tính utility đầy đủ.
+
+Trong mỗi lần gán, kiến đầu tiên chọn tham lam theo trọng số cao nhất để bảo đảm có một baseline tốt. Các kiến còn lại trộn thứ tự shipper và chọn đơn theo xác suất tỉ lệ với $w(s,o)$. Lời giải có tổng utility cao nhất được chọn làm assignment cuối cùng. Thiết kế này giữ được tinh thần khám phá của ACO nhưng không để chi phí vượt quá ngân sách thời gian thực.
+
+\subsubsection{Pressure map cho Surge/Hotspot}
+ACO không đọc trực tiếp cấu hình surge/hotspot. Thay vào đó, tại mỗi bước, các đơn mới xuất hiện được cộng vào bản đồ áp lực:
+\begin{equation}
+P_z \leftarrow \gamma P_z
+\end{equation}
+\begin{equation}
+P_{z(o)} \leftarrow P_{z(o)} +
+p_o \left(1 + \min\left(3, \frac{30}{\max(e_o-t,1)}\right)\right)
+\end{equation}
+Trong đó $\gamma = 0.97$ là hệ số suy giảm. Khi shipper rảnh không có đơn phù hợp, solver chọn vùng có điểm pressure/khoảng cách tốt nhất để reposition. Cơ chế này đặc biệt có ích ở các cấu hình có đơn hàng bùng phát theo cụm: shipper được kéo về gần nguồn đơn mới trước khi assignment tiếp theo xảy ra.
+
+\subsubsection{Opportunistic Pickup khi đang giao hàng}
+Với shipper đang mang hàng, mục tiêu mặc định là giao đơn có reward density cao và khả năng đúng hạn tốt nhất. Tuy nhiên, nếu còn tải trọng và số slot trong túi, solver thử nhặt thêm một đơn gần đường đi. Ứng viên chỉ được nhận nếu lộ trình mới làm tăng net reward so với baseline không nhặt thêm:
+\begin{equation}
+\Delta Net = Net_{\text{new}} - Net_{\text{baseline}} > 0.05
+\end{equation}
+Đồng thời, thuật toán kiểm tra deadline của các đơn đang mang để tránh trường hợp nhặt thêm một đơn nhỏ nhưng làm trễ đơn quan trọng. Đây là điểm giúp ACO khai thác tốt tải trọng mà vẫn không phá mục tiêu giao đúng hạn.
+
+\subsubsection{Di chuyển lai A*/BFS và học tắc nghẽn}
+ACO nguyên thủy có thể dùng kiến để tìm cả đường đi trên lưới, nhưng cách này không phù hợp với bản đồ lớn. Trong \texttt{aco\_solver.py}, bản đồ nhỏ dùng rollout ACO với \texttt{path\_ants}; còn bản đồ từ $N \ge 15$ mặc định dùng A* có xét các ô đã được shipper khác đặt trước. Các khoảng cách BFS/A* được cache để giảm chi phí lặp lại.
+
+Sau mỗi bước, nếu shipper tiến gần mục tiêu hơn, pheromone chuyển động \texttt{tau\_move} theo vùng và hướng đi được tăng nhẹ; nếu đi kém hoặc bị kẹt nhiều lần, thuật toán tăng \texttt{congestion} cho vùng hiện tại. Tầng này không đảm bảo tránh mọi va chạm như CBS, nhưng đủ nhẹ để xử lý các xung đột trực tiếp trong thời gian thực.
 
 \subsection{Kết quả}
-<---Có dẫn chứng cụ thể bằng bảng / hình ảnh--->
-<---Mỗi hình ảnh / bảng phải có phân tích 1-2 câu--->
+
 
 \subsection{Đánh giá độ phức tạp}
-<--- Có giải thích tại sao--->
+Gọi $V$ là số ô trống trên bản đồ, $C$ là số shipper, $M$ là số đơn đang hoạt động, $A$ là số ứng viên tối đa sau lọc, $I$ là số kiến dùng cho assignment, $K$ là sức chứa đơn tối đa trong túi, $H$ là số kiến rollout đường đi và $L$ là độ dài rollout tối đa.
+
+\subsubsection{Khởi tạo và cache khoảng cách}
+Solver xây dựng danh sách kề cho toàn bộ ô trống với chi phí $O(V)$. Khác với Greedy BFS cải tiến, ACO không tiền tính APSP toàn cục $O(V^2)$ bộ nhớ, mà dùng cache theo nhu cầu. Một lần BFS từ một nguồn tốn $O(V)$; một lần A* trên bản đồ lớn tốn biên $O(V \log V)$. Nhờ cache \texttt{\_bfs\_cache}, \texttt{\_dist\_cache} và \texttt{\_pair\_dist\_cache}, các truy vấn lặp lại giữa cùng cặp vị trí thường chỉ còn $O(1)$.
+
+\subsubsection{Mỗi bước thời gian}
+Với chế độ mặc định \texttt{assign\_mode=auto}, solver dùng ant assignment. Việc tạo ứng viên và chấm điểm cho mỗi shipper tốn xấp xỉ $O(M \log M + A)$ nếu bỏ qua cache miss khoảng cách. Với $I$ kiến và tối đa $C$ shipper rảnh, tầng gán đơn có chi phí:
+\begin{equation}
+O(I \cdot C \cdot (M \log M + A))
+\end{equation}
+Các shipper đang mang hàng cần chọn đơn giao và thử opportunistic pickup. Trong trường hợp xấu nhất, mỗi shipper duyệt qua $M$ đơn và đánh giá lộ trình gồm tối đa $K$ đơn trong túi, nên chi phí xấp xỉ:
+\begin{equation}
+O(C \cdot M \cdot K)
+\end{equation}
+Tầng di chuyển tốn $O(C \cdot V \log V)$ khi phải gọi A* mới trên bản đồ lớn, hoặc $O(C \cdot H \cdot L)$ khi dùng rollout ACO trên bản đồ nhỏ. Bộ sửa deadlock duyệt từng cặp shipper nên tốn $O(C^2)$.
+
+Như vậy, chi phí thực dụng mỗi bước được chặn bởi:
+\begin{equation}
+O(I C (M \log M + A) + C M K + C^2 + C P_{move})
+\end{equation}
+Trong đó $P_{move}$ là chi phí tìm bước đi. Với các tham số mặc định $I=10$ khi $C \le 8$, $I=6$ khi $C$ lớn hơn, $A \le 35$ và cache khoảng cách, thuật toán chạy nhanh hơn các phương pháp lập kế hoạch toàn cục nhưng vẫn có khả năng học từ lịch sử giao hàng.
 
 \subsection{Đánh giá thuật toán}
-<---Phân tích mức độ tối ưu: optimal, near-optimal hoặc heuristic, kèm điều kiện đảm bảo nếu có--->
-<---Đánh giá ưu nhược điểm thuật toán --->
-<---Tiểu kết--->
+\subsubsection{Mức độ tối ưu}
+ACO trong project là thuật toán \textbf{meta-heuristic theo online learning}, không đảm bảo tối ưu toàn cục. Lý do là solver chỉ xét một tập ứng viên giới hạn, số kiến hữu hạn, dùng cache và fallback chuyển động, đồng thời ra quyết định trong môi trường đơn hàng xuất hiện động. Tuy nhiên, so với Greedy BFS, ACO có thêm bộ nhớ pheromone và pressure map nên ít bị phụ thuộc hoàn toàn vào quyết định cục bộ của một bước thời gian.
 
-% ---------------------------------------------
-% ACO
-% ---------------------------------------------
-\section{Thuật toán ACO}
-\subsection{Giới thiệu thuật toán}
-<---Giới thiệu thuật toán nguyên thủy / thuật toán cũ--->
-<---Chỉ ra các nút thắt cổ chai--->
+\subsubsection{Ưu điểm}
+\begin{itemize}
+    \item \textbf{Có khả năng học online:} Pheromone pickup/flow giúp thuật toán ưu tiên những vùng và luồng giao hàng từng đem lại reward tốt.
+    \item \textbf{Thích ứng với surge/hotspot:} Pressure map được cập nhật từ đơn mới, không cần đọc cấu hình ẩn của môi trường.
+    \item \textbf{Cân bằng exploration và exploitation:} Kiến đầu tiên chọn greedy để có baseline ổn định, các kiến còn lại chọn theo xác suất để khám phá phương án khác.
+    \item \textbf{Chi phí thấp hơn lập kế hoạch toàn cục:} Giới hạn ứng viên, cache khoảng cách và A* theo nhu cầu giúp solver chạy nhanh trên bộ Phase 1.
+    \item \textbf{Tận dụng tải trọng tốt hơn greedy đơn giản:} Opportunistic pickup chỉ nhận đơn phụ khi net reward dự kiến tăng và không làm hỏng deadline của đơn đang mang.
+\end{itemize}
 
-\subsection{Triết lý thuật toán}
+\subsubsection{Nhược điểm}
+\begin{itemize}
+    \item \textbf{Không có đảm bảo tối ưu:} Kết quả phụ thuộc vào số kiến, giới hạn ứng viên, hệ số $\alpha,\beta,\rho$ và chất lượng utility.
+    \item \textbf{Pheromone học chậm khi phân bố thay đổi mạnh:} Dù có bay hơi, các vùng từng tốt vẫn có thể được ưu tiên quá lâu nếu pattern đơn hàng đổi đột ngột.
+    \item \textbf{Xử lý va chạm chưa triệt để:} Deadlock resolver chỉ xử lý tốt xung đột cục bộ, không lập kế hoạch tránh va chạm nhiều bước như MAPD-CBS.
+    \item \textbf{Reposition còn xấp xỉ:} Pressure target dùng tâm vùng và điểm pressure/khoảng cách, nên có thể chưa chọn đúng vị trí tối ưu trong vùng có vật cản.
+\end{itemize}
 
-\subsection{Cách thức hoạt động}
+\subsubsection{Tiểu kết}
+ACO là phương án trung gian giữa Greedy BFS và các bộ giải lập kế hoạch nặng hơn. Thuật toán vẫn giữ được tốc độ phản ứng cao, nhưng bổ sung khả năng học từ các giao hàng thành công và nhận biết áp lực đơn hàng online. Điểm mạnh của ACO nằm ở các cấu hình có pattern đơn hàng lặp lại hoặc hotspot rõ ràng; điểm yếu là không xử lý phối hợp không gian sâu bằng CBS và không tối ưu assignment toàn cục chặt chẽ như VRP/Hungarian.
 
-\subsection{Ý tưởng tối ưu và và đánh giá}
-<---Mỗi phân tích là 1 subsubsection--->
-<---Nêu rõ kết quả và tại sao hiệu quả / tại sao không hiệu quả--->
-
-\subsection{Kết quả}
-<---Có dẫn chứng cụ thể bằng bảng / hình ảnh--->
-<---Mỗi hình ảnh / bảng phải có phân tích 1-2 câu--->
-
-\subsection{Đánh giá độ phức tạp}
-<--- Có giải thích tại sao--->
-
-\subsection{Đánh giá thuật toán}
-<---Phân tích mức độ tối ưu: optimal, near-optimal hoặc heuristic, kèm điều kiện đảm bảo nếu có--->
-<---Đánh giá ưu nhược điểm thuật toán --->
-<---Tiểu kết--->
 
 % ---------------------------------------------
 % MAPD-CBS
 % ---------------------------------------------
 \section{Thuật toán MAPD-CBS}
 \subsection{Giới thiệu thuật toán}
-<---Giới thiệu thuật toán nguyên thủy / thuật toán cũ--->
-<---Chỉ ra các nút thắt cổ chai--->
+MAPD-CBS là hướng tiếp cận kết hợp giữa bài toán \textit{Multi-Agent Pickup and Delivery} (MAPD) và \textit{Conflict-Based Search} (CBS). Trong MAPD, mỗi shipper không chỉ cần đi tới một đích cố định, mà còn phải liên tục nhận và giao nhiều đơn hàng xuất hiện online theo thời gian \cite{ma2017lifelong}. Trong khi đó, CBS nguyên thủy được thiết kế cho bài toán MAPF với tập tác tử và mục tiêu đã biết trước: tầng cao duy trì cây ràng buộc (Constraint Tree), còn tầng thấp tìm lại đường đi cho từng tác tử khi phát hiện xung đột đỉnh hoặc xung đột cạnh \cite{sharon2015cbs}.
+
+Nếu áp dụng CBS nguyên thủy trực tiếp cho bài toán giao hàng của đề bài, thuật toán gặp ba nút thắt lớn. Thứ nhất, đơn hàng xuất hiện động nên mục tiêu của shipper thay đổi liên tục, khiến việc tìm một kế hoạch toàn cục từ $t=0$ đến $T$ không thực tế. Thứ hai, số lượng shipper và đơn hàng lớn làm cây ràng buộc của CBS tăng theo hàm mũ khi có nhiều xung đột trong hotspot. Thứ ba, tối ưu đường đi không đủ để tối đa hóa điểm, vì hệ thống còn phải xét deadline, tải trọng, số lượng đơn trong túi và phần thưởng ưu tiên. Do đó, trong project này MAPD-CBS được triển khai như một kiến trúc hai tầng: tầng trên phân công nhiệm vụ bằng rolling-horizon ACO/heuristic, tầng dưới dùng windowed CBS để làm mượt chuyển động và giảm va chạm trong một cửa sổ thời gian ngắn.
 
 \subsection{Triết lý thuật toán}
+\begin{center}
+    \textbf{"Phân công linh hoạt, di chuyển có phối hợp"}
+\end{center}
+
+Khác với Greedy BFS chỉ nhìn quyết định cục bộ của từng shipper, và khác với VRP-Ortools tập trung vào kế hoạch vĩ mô, MAPD-CBS đặt trọng tâm vào khả năng phối hợp khi nhiều shipper cùng tranh chấp không gian hẹp. Thuật toán chấp nhận rằng trong môi trường online không thể tối ưu tuyệt đối toàn bộ tương lai, nhưng vẫn phải tránh các quyết định gây kẹt cục bộ như hai shipper đổi chỗ qua cùng một hành lang, nhiều shipper cùng lao vào một pickup point, hoặc shipper rỗng chặn đường shipper đang mang hàng.
 
 \subsection{Cách thức hoạt động}
+Tại mỗi bước thời gian $t$, thuật toán thực hiện chu trình sau:
+
+\begin{enumerate}
+    \item \textbf{Quan sát trạng thái hiện tại:} Lấy danh sách đơn hàng đã xuất hiện, vị trí shipper, túi hàng hiện tại, deadline và các giới hạn $W_{max}, K_{max}$.
+    \item \textbf{Tái lập lịch khi cần:} Nếu đã hết khoảng \texttt{replan\_interval}, hoặc có đủ đơn mới xuất hiện, tầng ACO xây dựng lại hàng đợi mục tiêu cho từng shipper. Mỗi mục tiêu có dạng $(pos, op, id)$, trong đó $op=1$ là nhặt hàng và $op=2$ là giao hàng.
+    \item \textbf{Chọn mục tiêu gần hạn:} Với shipper đang mang hàng, thuật toán ưu tiên đơn có deadline gấp và còn khả năng đem lại reward. Với shipper rỗng, hệ thống chọn pickup khả thi dựa trên điểm kỳ vọng, đồng thời dùng tập \texttt{reserved} để tránh nhiều shipper cùng nhận một đơn.
+    \item \textbf{Tìm đường không xung đột:} Từ vị trí hiện tại và mục tiêu ngắn hạn của các shipper, tầng CBS tìm đường trong cửa sổ $W$ bước. Nếu dùng chế độ \texttt{full}, CBS chạy trên toàn bộ shipper. Nếu dùng chế độ \texttt{group}, thuật toán chỉ chạy CBS trên các nhóm đang có nguy cơ xung đột.
+    \item \textbf{Xuất một bước hành động:} Từ đường đi CBS, solver chỉ lấy bước đầu tiên làm action cho môi trường. Sau đó lớp xử lý deadlock cục bộ tiếp tục kiểm tra va chạm cùng ô, đổi chỗ cạnh và tình huống shipper rảnh chặn đường shipper có hàng.
+\end{enumerate}
+
+Trong tầng CBS, mỗi đường đi được biểu diễn dưới dạng:
+\begin{equation}
+\pi_i = (v_i^0, v_i^1, \ldots, v_i^W)
+\end{equation}
+Xung đột đỉnh xảy ra khi hai shipper cùng đứng ở một ô tại cùng thời điểm:
+\begin{equation}
+v_i^\tau = v_j^\tau
+\end{equation}
+Xung đột cạnh xảy ra khi hai shipper đổi chỗ trực tiếp qua cùng một cạnh:
+\begin{equation}
+v_i^\tau = v_j^{\tau+1}, \quad v_i^{\tau+1} = v_j^\tau
+\end{equation}
+Khi phát hiện xung đột đầu tiên, CBS tạo hai nhánh ràng buộc: một nhánh cấm shipper thứ nhất thực hiện trạng thái/chuyển động gây xung đột, nhánh còn lại cấm shipper thứ hai. Tầng thấp dùng Space-Time A* để tìm lại đường cho tác tử bị ràng buộc.
 
 \subsection{Ý tưởng tối ưu và và đánh giá}
-<---Mỗi phân tích là 1 subsubsection--->
-<---Nêu rõ kết quả và tại sao hiệu quả / tại sao không hiệu quả--->
+\subsubsection{Rolling-Horizon ACO cho phân công nhiệm vụ}
+Thay vì để CBS xử lý cả phân công đơn hàng lẫn tránh va chạm, nhóm tách bài toán thành hai phần. Tầng ACO chọn chuỗi pickup/delivery ngắn hạn dựa trên pheromone và hàm hấp dẫn $\eta$. Với một đơn $o$, điểm pickup được ước lượng theo reward kỳ vọng trên tổng quãng đường:
+\begin{equation}
+\eta_{pick}(o) =
+\frac{R(o, t + d_{pick} + d_{drop})}{d_{pick}+d_{drop}+1}
++ \frac{\lambda_u}{\max(e_o - t, 1)}
++ \lambda_p p_o
+\end{equation}
+Trong đó $R$ là hàm thưởng giao hàng, $e_o$ là deadline, $p_o$ là mức ưu tiên và $d_{pick}, d_{drop}$ được tra cứu qua \texttt{PathFinder}. Cách tách này giúp CBS chỉ cần xử lý mục tiêu đã được chọn, giảm mạnh không gian tìm kiếm so với việc đưa toàn bộ đơn hàng vào cây ràng buộc.
+
+\subsubsection{Windowed CBS thay cho CBS toàn horizon}
+CBS tối ưu nguyên thủy có chi phí lớn vì phải lập kế hoạch tới tận đích cuối. Trong project, tầng CBS chỉ chạy trên cửa sổ ngắn $W$ bước, mặc định $W=12$ ở cấu hình nhỏ và giảm còn $6$ hoặc $8$ ở cấu hình lớn. Điều này phù hợp với môi trường online: sau mỗi vài bước, đơn mới có thể xuất hiện và kế hoạch cũ cần được cập nhật. Windowed CBS không đảm bảo tối ưu toàn cục, nhưng xử lý đúng phần quan trọng nhất là các va chạm sắp xảy ra.
+
+\subsubsection{Group CBS theo cụm xung đột}
+Với bản đồ lớn hoặc số shipper nhiều, chạy CBS trên toàn bộ $C$ shipper ở mỗi bước sẽ không khả thi. Solver vì vậy dự đoán trước action độc lập của từng shipper, phát hiện các cặp có nguy cơ cùng ô, đổi chỗ hoặc chắn nhau, rồi gom chúng thành các nhóm xung đột bằng cấu trúc union-find. CBS chỉ chạy trên nhóm có kích thước không vượt quá \texttt{group\_cbs\_max\_size}. Nhờ vậy, độ khó của CBS phụ thuộc vào số shipper đang thật sự tranh chấp không gian, thay vì phụ thuộc vào toàn bộ đội shipper.
+
+\subsubsection{Ràng buộc deadline và ngân sách thời gian}
+Ở cấu hình lớn, thuật toán bật \texttt{strict\_deadline\_mode} để loại bỏ các đơn có thời gian giao ước lượng vượt deadline quá xa. Các tham số \texttt{window\_size}, \texttt{cbs\_max\_nodes}, \texttt{cbs\_time\_limit}, số vòng ACO và số đơn active đều được điều chỉnh theo $N, C, G$. Ví dụ, khi $G \ge 1000$ hoặc $C \ge 20$, solver giảm cửa sổ CBS xuống $6$, giới hạn số node CBS còn $10$ và chuyển sang chế độ group. Đây là đánh đổi cần thiết để giữ chương trình chạy trong giới hạn 60 phút trên Kaggle.
+
+\subsubsection{Xử lý deadlock cục bộ}
+Khi CBS hết thời gian hoặc không tìm được lời giải trong ngân sách, solver không dừng lại mà rơi về action độc lập rồi sửa lỗi cục bộ. Lớp \texttt{\_resolve\_deadlocks} ưu tiên shipper đang mang hàng hoặc sắp giao hàng, yêu cầu shipper rảnh nhường đường nếu có ô an toàn, phá xung đột cùng ô bằng cách cho shipper ưu tiên thấp đứng yên hoặc bước sang ô phụ, và xử lý trường hợp hai shipper đổi chỗ qua một cạnh. Cơ chế này làm giảm tác hại của các lần CBS thất bại, đặc biệt trong hành lang hẹp.
 
 \subsection{Kết quả}
-<---Có dẫn chứng cụ thể bằng bảng / hình ảnh--->
-<---Mỗi hình ảnh / bảng phải có phân tích 1-2 câu--->
+\begin{table}[htbp]
+\caption{Kết quả MAPD-CBS trên bộ \texttt{test\_config.txt}}
+\label{tab:mapd-cbs-phase1}
+\centering
+\footnotesize
+\begin{tabular}{|c|r|c|c|r|}
+\hline
+\textbf{Config} & \textbf{Net reward} & \textbf{Giao} & \textbf{Đúng hạn} & \textbf{Time} \\
+\hline
+C1 & 265.93 & 13/15 & 100.0\% & 0.75s \\
+C2 & 456.17 & 24/25 & 87.5\% & 0.51s \\
+C3 & 911.54 & 37/40 & 97.3\% & 1.62s \\
+C4 & 1065.64 & 56/60 & 94.6\% & 4.78s \\
+C5 & 1391.89 & 75/80 & 82.7\% & 6.95s \\
+C6 & 1729.54 & 91/100 & 90.1\% & 5.14s \\
+\hline
+\textbf{Tổng} & \textbf{5820.70} & \textbf{296/320} & \textbf{90.2\%} & \textbf{19.75s} \\
+\hline
+\end{tabular}
+\end{table}
+
+Kết quả ở Bảng \ref{tab:mapd-cbs-phase1} cho thấy MAPD-CBS đạt tỷ lệ giao hàng tổng thể $92.5\%$ trên 6 cấu hình Phase 1, với tổng thời gian chạy dưới 20 giây khi chỉ chạy riêng phương pháp này. Tỷ lệ đúng hạn giảm ở C5 do bản đồ lớn hơn, số đơn cao hơn và nhiều đơn bị gom vào các lộ trình dài, nhưng thuật toán vẫn giữ được delivery rate trên $90\%$ ở tất cả cấu hình từ C2 đến C6.
+
+Thống kê nội bộ cho thấy trong 6 cấu hình, CBS được gọi 3180 lần và tìm được đường không xung đột trong 2698 lần. Các lần còn lại được xử lý bằng action độc lập và bộ sửa deadlock, cho thấy thiết kế fallback là cần thiết: nếu bắt CBS luôn phải thành công, thuật toán sẽ dễ bị quá thời gian ở các thời điểm mật độ shipper cao.
 
 \subsection{Đánh giá độ phức tạp}
-<--- Có giải thích tại sao--->
+Gọi $V$ là số ô trống trên bản đồ, $C$ là số shipper, $A$ là số đơn active sau khi lọc, $I$ là số vòng ACO, $L$ là giới hạn số điểm dừng trong một route, $W$ là kích thước cửa sổ CBS, $B$ là số node CBS tối đa và $m$ là số shipper trong một nhóm xung đột.
+
+Tầng phân công ACO có độ phức tạp xấp xỉ:
+\begin{equation}
+O(I \cdot C \cdot L \cdot A)
+\end{equation}
+do mỗi vòng xây dựng lời giải bằng cách xét các pickup/delivery khả thi cho từng shipper. Nhờ \texttt{PathFinder}, khoảng cách giữa hai ô thường được tra cứu $O(1)$ sau tiền xử lý, nên chi phí chính nằm ở số ứng viên đơn hàng và số vòng lặp.
+
+Tầng Space-Time A* trong CBS có không gian trạng thái tối đa $O(WV)$ cho mỗi shipper trong cửa sổ $W$. Với heap ưu tiên, một lần tìm đường có độ phức tạp biên:
+\begin{equation}
+O(WV \log(WV))
+\end{equation}
+CBS tầng cao có độ phức tạp xấu nhất theo hàm mũ theo số xung đột, vì mỗi xung đột tạo hai nhánh ràng buộc. Tuy nhiên trong triển khai thực tế, số node bị chặn bởi $B$ và CBS thường chỉ chạy trên nhóm nhỏ $m$, nên chi phí thực dụng được giới hạn bởi:
+\begin{equation}
+O(B \cdot m \cdot WV \log(WV))
+\end{equation}
+Bộ nhớ gồm hàng đợi mục tiêu $O(CL)$, tập đơn active $O(A)$, các path CBS $O(mW)$ và cache đường đi. Nếu tiền xử lý APSP bằng PyTorch thành công, ma trận khoảng cách cần $O(V^2)$ bộ nhớ; nếu không, solver dùng BFS cache theo nhu cầu để giảm bộ nhớ nhưng tăng thời gian tra cứu.
 
 \subsection{Đánh giá thuật toán}
-<---Phân tích mức độ tối ưu: optimal, near-optimal hoặc heuristic, kèm điều kiện đảm bảo nếu có--->
-<---Đánh giá ưu nhược điểm thuật toán --->
-<---Tiểu kết--->
+MAPD-CBS trong project là một thuật toán \textbf{heuristic theo rolling horizon}. CBS nguyên thủy có thể tối ưu cho MAPF tĩnh khi được chạy đầy đủ trên toàn bộ cây ràng buộc và với mục tiêu cố định. Tuy nhiên, phiên bản triển khai đã giới hạn cửa sổ thời gian, cắt số node CBS, lọc đơn hàng và dùng fallback khi hết ngân sách. Vì vậy thuật toán không đảm bảo tối ưu toàn cục cho bài toán MAPD online, nhưng có khả năng tạo lời giải tốt và ổn định trong thời gian thực.
+
+Ưu điểm lớn nhất của MAPD-CBS là xử lý rõ ràng các xung đột đa tác tử mà Greedy BFS và VRP-Ortools thường bỏ qua hoặc giao cho môi trường tự chặn. Điều này giúp giảm tắc nghẽn tại hành lang hẹp, cổng hẹp và hotspot. Ngoài ra, việc tách tầng phân công nhiệm vụ khỏi tầng tránh va chạm giúp thuật toán dễ mở rộng: ACO có thể được thay bằng VRP hoặc heuristic khác mà vẫn giữ nguyên CBS cho điều phối chuyển động.
+
+Nhược điểm là chi phí tính toán nhạy với mật độ shipper. Khi nhiều shipper cùng đi qua một vùng nhỏ, số xung đột tăng nhanh và CBS dễ chạm giới hạn thời gian. Windowed CBS cũng chỉ nhìn thấy các xung đột gần, nên một số deadlock dài hạn vẫn phải giải bằng cơ chế nhường đường cục bộ. Nhìn chung, MAPD-CBS phù hợp nhất khi mục tiêu đánh giá nhấn mạnh tính phối hợp đa tác tử và an toàn chuyển động; trong các cấu hình rất lớn, cần dùng group CBS và lọc deadline mạnh để giữ tốc độ chạy.
 
 % ---------------------------------------------
 % TỔNG HỢP
