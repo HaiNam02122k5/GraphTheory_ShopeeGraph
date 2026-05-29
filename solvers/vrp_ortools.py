@@ -291,7 +291,11 @@ def search_optimal_routing_numba(
     best_score = -1e9
     best_log_idx = -1
     
+    iter_count = 0
     while stack_ptr > 0:
+        iter_count += 1
+        if iter_count > 5000:
+            break
         stack_ptr -= 1
         curr_u = stack_u[stack_ptr]
         curr_t = stack_t[stack_ptr]
