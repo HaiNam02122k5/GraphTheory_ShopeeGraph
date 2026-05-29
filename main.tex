@@ -1,0 +1,371 @@
+\documentclass[conference]{IEEEtran}
+% \IEEEoverridecommandlockouts
+% % The preceding line is only needed to identify funding in the first footnote.
+% % If that is unneeded, comment it out.
+
+% Vietnamese support
+\usepackage[utf8]{inputenc}
+\usepackage[T5]{fontenc}
+\usepackage[vietnamese,english]{babel}
+\usepackage{indentfirst}
+\setlength{\parindent}{1em}
+
+% Core packages from the IEEE conference template
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Báo cáo kết quả \\ Tối ưu hóa giao hàng đa tác tử thời gian thực
+}
+
+\author{\IEEEauthorblockN{1\textsuperscript{st} Nguyễn Hải Nam (23021643)}
+\IEEEauthorblockA{\textit{Khoa Công nghệ thông tin (FIT)} \\
+\textit{Trường Đại học Công nghệ - ĐHQGHN}\\
+Hà Nội, Việt Nam \\
+23021643@vnu.edu.vn}
+\and
+\IEEEauthorblockN{2\textsuperscript{nd} Nguyễn Việt Thắng (23021723)}
+\IEEEauthorblockA{\textit{Khoa Công nghệ thông tin (FIT)} \\
+\textit{Trường Đại học Công nghệ - ĐHQGHN}\\
+Hà Nội, Việt Nam \\
+23021723@vnu.edu.vn}
+\and
+\IEEEauthorblockN{3\textsuperscript{rd} Võ Minh Dũng (23021499)}
+\IEEEauthorblockA{\textit{Khoa Công nghệ thông tin (FIT)} \\
+\textit{Trường Đại học Công nghệ - ĐHQGHN}\\
+Hà Nội, Việt Nam \\
+23021499@vnu.edu.vn}
+}
+
+\maketitle
+
+\begin{abstract}
+Bài báo cáo này trình bày kết quả nghiên cứu và tối ưu hóa hệ thống giao hàng đa tác tử thời gian thực trên bản đồ lưới có vật cản. Nhóm nghiên cứu đã triển khai và so sánh bốn thuật toán bao gồm Greedy BFS cải tiến, VRP kết hợp Google OR-Tools, Tối ưu hóa bầy kiến (ACO) và Tìm kiếm dựa trên xung đột (MAPD-CBS). Kết quả thực nghiệm cho thấy VRP-Ortools và Greedy BFS cải tiến đạt được sự cân bằng rất tốt giữa hiệu năng phần thưởng ròng và tốc độ tính toán, đáp ứng đầy đủ các ràng buộc thực thi trên nền tảng Kaggle.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Multi-Agent Pathfinding, Vehicle Routing Problem, Real-time Logistics, Greedy BFS, Google OR-Tools, Conflict-Based Search
+\end{IEEEkeywords}
+
+% ---------------------------------------------
+% GIỚI THIỆU 
+% ---------------------------------------------
+\section{Giới thiệu}
+\subsection{Phát biểu bài toán}
+Trong kỷ nguyên số và sự bùng nổ của thương mại điện tử, các hệ thống điều phối logistics thời gian thực (Real-time Logistics Orchestration) đóng vai trò xương sống trong việc tối ưu hóa vận hành doanh nghiệp. Bài nghiên cứu này tập trung vào bài toán Tối ưu hóa giao hàng đa tác tử thời gian thực (Real-time Multi-Agent Smart Delivery Optimization) trên mô hình bản đồ lưới $N \times N$.
+
+Mục tiêu cốt lõi là tối đa hóa tổng phần thưởng ròng (Net Reward) trong $T$ bước thời gian, dựa trên việc cân bằng giữa ba yếu tố kỹ thuật:
+
+\begin{itemize}
+    \item \textbf{Hiệu suất thời gian:} Đảm bảo tỷ lệ giao hàng đúng hạn (On-time Delivery) dựa trên deadline nghiêm ngặt của từng đơn hàng.
+
+    \item \textbf{Giá trị kinh tế:} Ưu tiên xử lý các đơn hàng có mức độ khẩn cấp cao (Tiêu chuẩn, Nhanh, Hỏa tốc) và trọng lượng lớn để tối ưu hóa doanh thu cơ bản.
+
+    \item \textbf{Chi phí vận hành:} Giảm thiểu tối đa chi phí tiêu hao năng lượng/di chuyển của shipper, vốn tỷ lệ thuận với khối lượng hàng hóa hiện tại trên xe (tải trọng động).
+\end{itemize}
+
+\subsection{Thách thức cốt lõi}
+Bài toán đặt ra các thách thức kỹ thuật mang tính phi tuyến và động lực học cao, vượt xa các bài toán định tuyến tĩnh truyền thống:
+
+\begin{itemize}
+    \item \textbf{Tính chất động và không chắc chắn:} Đơn hàng xuất hiện liên tục theo thời gian thực với các thông số quy luật sinh đơn bị ẩn.
+
+    \item \textbf{Hiện tượng nút cổ chai cục bộ (Surge và Hotspot):} Đơn hàng tăng vọt về số lượng tại các khung giờ cao điểm và tập trung mật độ cao quanh các tâm điểm (Hotspots), gây áp lực lớn lên hệ thống điều phối.
+
+    \item \textbf{Ràng buộc kép và va chạm:} Mỗi shipper phải thỏa mãn đồng thời giới hạn về tải trọng ($W_{max}$) và số lượng đơn hàng ($K$), đồng thời phải tự giải quyết xung đột không gian (không đứng cùng ô) khi di chuyển trên lưới.
+\end{itemize}
+
+\subsection{Các phương pháp tiếp cận nghiên cứu}
+Để giải quyết bài toán từ cơ bản đến nâng cao, nhóm đã triển khai, đánh giá và so sánh thực nghiệm 4 thuật toán chia làm hai nhóm chiến lược:
+
+\subsubsection{Nhóm phương pháp bắt buộc (Baseline)}
+\begin{itemize}
+    \item \textbf{Greedy BFS:} Tiếp cận tham lam cục bộ. Sử dụng thuật toán tìm kiếm theo chiều rộng (BFS) để tìm đường đi ngắn nhất trên lưới có vật cản, ưu tiên giao nhận các đơn hàng tối ưu nhất tại thời điểm hiện tại.
+
+    \item \textbf{VRP + OR-Tools:} Tiếp cận quy hoạch toán học tiệm cận tối ưu. Mô hình hóa hệ thống thành bài toán Định tuyến phương tiện (Vehicle Routing Problem) có ràng buộc, sử dụng bộ giải của Google OR-Tools để tối ưu hóa lộ trình toàn cục cho tập đơn hàng tĩnh theo từng cửa sổ thời gian.
+\end{itemize}
+
+\subsubsection{Nhóm phương pháp nâng cao (Advanced)}
+\begin{itemize}
+    \item \textbf{Ant Colony Optimization (ACO):} Thuật toán giải thuật bầy đàn (Meta-heuristic). Sử dụng cơ chế mô phỏng hành vi vết pheromone của loài kiến để tìm kiếm không gian lời giải tối ưu, giúp hệ thống phân phối lộ trình linh hoạt và tránh bẫy tối ưu cục bộ.
+
+    \item \textbf{MAPD-CBS:} Thuật toán Conflict-Based Search chuyên biệt cho hệ thống đa tác tử. Giải quyết triệt để bài toán phân cấp và triệt tiêu hoàn toàn xung đột/va chạm đường đi giữa các shipper, đặc biệt hiệu quả trong việc giải tỏa nút cổ chai tại các khu vực Hotspot.
+\end{itemize}
+
+\subsection{Mục tiêu và Phạm vi}
+\subsubsection{Mục tiêu}
+Nhóm chúng em có những mục tiêu chính sau:
+
+\begin{itemize}
+    \item Phát triển, tối ưu thuật toán phục vụ cho việc giải quyết các thách thức của bài toán đã nêu.
+    \item Nghiên cứu các đánh đổi, độ phức tạp, các hướng tối ưu cho từng thuật toán.
+    \item Nghiên cứu cách kết hợp thuật toán để tăng hiệu quả trong việc giải quyết bài toán.
+    \item Thực hiện nội suy, làm mịn các thông số để đưa bài toán thành tổng quát hóa, thích nghi được với mọi cấu hình.
+\end{itemize}
+
+\subsubsection{Phạm vi}
+Nhóm cũng đã giới hạn các khía cạnh để phù hợp với yêu cầu của bài toán, với các giới hạn cụ thể sau:
+
+\begin{itemize}
+    \item \textbf{Đối tượng nghiên cứu chính:} Tập trung vào 4 thuật toán chính đã được liệt kê ở trên là Greedy BFS, VRP + Ortools, ACO và MAPD - CBS.
+    \item \textbf{Hệ thống đối sánh:} Có sự so sánh, đối chiếu giữa các thuật toán với nhau để đánh giá trong thực hiện tối ưu. 
+    \item \textbf{Phạm vi cấu hình:} Đảm bảo thuật toán chạy đúng với các yêu cầu đề ra: thời gian (60 phút), cấu hình (N <= 100, C <= 25, G <= 1500, T <= 2400), môi trường (Kaggle).
+    \item \textbf{Tiêu chí đánh giá:}
+        \begin{itemize}
+        \item \textit{Điểm thưởng và Tốc độ thực thi thực tế (Net reward and Execution speed):} Phân tích các khía cạnh tối ưu từ điểm thưởng và tốc độ thực thi, từ đó giải thích liệu rằng thuật toán đã đạt mức độ tối ưu nào.
+        \item \textit{Độ phức tạp thuật toán:} Đánh giá độ phức tạp thuật toán theo không gian và theo thời gian.
+        \end{itemize}
+
+\end{itemize}
+
+
+% ---------------------------------------------
+% PHÂN TÍCH BÀI TOÁN
+% ---------------------------------------------
+\section{Phân tích bài toán}
+\subsection{Mô tả bài toán}
+Bài toán mô phỏng hệ thống giao hàng thực tế: một đội C shipper hoạt động đồng thời trên bản đồ lưới N × N, nhận và giao các kiện hàng có trọng lượng, mức ưu tiên và deadline khác nhau. Đơn hàng xuất hiện liên tục theo thời gian với tốc độ biến động, bao gồm các đợt cao điểm, gọi là surge, tập trung tại một số khu vực đặc biệt, gọi là hotspot, tạo ra nút cổ chai cục bộ. Nhiệm vụ của nhóm là thiết kế thuật toán phân công và điều phối shipper để tối đa hóa tổng phần thưởng trong T bước thời gian, cân bằng giữa giao đúng hạn, xử lý đơn ưu tiên cao và chi phí di chuyển.
+
+\subsection{Yêu cầu}
+Bài toán đề ra những yêu cầu chính như sau:
+
+\begin{itemize}
+    \item \textbf{Tối đa hóa hàm mục tiêu (Phần thưởng tích lũy):} Thiết kế chiến lược phân phối và định tuyến để đạt tổng điểm thưởng cao nhất trong $T$ bước thời gian, dựa trên việc hoàn thành đơn hàng, mức độ ưu tiên và thời gian giao hàng thực tế.
+    \item \textbf{Đảm bảo ràng buộc thời gian cứng (Deadline Constraints):} Hệ thống phải tự động hủy hoặc từ chối các đơn hàng không còn khả năng hoàn thành trước deadline để tối ưu hóa tài nguyên xử lý của đội ngũ shipper.
+    \item \textbf{Tối ưu hóa tài nguyên và chi phí vận hành:} Giảm thiểu tổng quãng đường di chuyển không cần thiết của $C$ shipper trên lưới $N \times N$, đồng thời quản lý tải trọng tối đa của từng phương tiện để tránh tình trạng quá tải cục bộ.
+    \item \textbf{Khả năng thích ứng động (Dynamic Adaptability):} Hệ thống phải phản hồi thời gian thực trước sự xuất hiện ngẫu nhiên của các đơn hàng mới, các biến động đột biến về nhu cầu (Surge) và vị trí phát sinh (Hotspot).
+\end{itemize}
+
+\subsection{Các phân tích chung}
+\subsubsection{Bản chất bài toán}
+Dưới góc nhìn thuật toán và kiến trúc hệ thống, bài toán này là sự kết hợp phức tạp của hai bài toán tối ưu kinh điển lớp NP-hard: \textbf{Dynamic Vehicle Routing Problem (DVRP - Bài toán định tuyến phương tiện động) và Multi-Agent Resource Allocation (MARA - Phân phối tài nguyên đa tác tử)}.
+
+\begin{itemize}
+    \item \textbf{Tính chất động và bất định (Stochastic and Dynamic Nature):} Vì đơn hàng xuất hiện liên tục theo thời gian, một quyết định tối ưu cục bộ tại thời điểm $t$ có thể dẫn đến trạng thái kém tối ưu tại thời điểm $t+1$. Hệ thống không thể sử dụng các thuật toán quy hoạch tĩnh (như Dijkstra hay quy hoạch tuyến tính thông thường) cho toàn bộ chu trình mà phải liên tục tái lập lịch (Re-optimization) hoặc sử dụng các mô hình học tăng cường (Reinforcement Learning) để dự báo xu hướng.
+    \item \textbf{Không gian trạng thái lớn (State Space Explosion):} Với lưới kích thước $N \times N$, số lượng shipper $C$, và hàng ngàn đơn hàng biến động liên tục, không gian trạng thái của hệ thống bùng nổ theo hàm mũ. Việc tìm kiếm lời giải tối ưu toàn cục (Global Optimum) trong thời gian thực là bất khả thi. Do đó, hệ thống cần các phương pháp tiếp cận heuristic, phân rã bài toán (Decomposition) hoặc phân tán (Decentralized/Multi-agent) để đưa ra quyết định trong thời gian $O(1)$ hoặc $O(N)$ tại mỗi bước thời gian.
+    \item \textbf{Sự đánh đổi đa mục tiêu (Multi-objective Trade-off):} Hệ thống luôn phải cân nhắc giữa hai yếu tố:
+        \begin{itemize}
+        \item \textit{Tham lam ngắn hạn (Greedy):} Giao ngay các đơn hàng gần nhất để lấy phần thưởng nhanh.
+        \item \textit{Chiến lược dài hạn (Strategic):} Điều hướng shipper đón đầu các khu vực sắp có Surge hoặc ưu tiên các đơn hàng có deadline ngặt nghèo nhưng ở xa để tránh bị phạt/hủy đơn.
+        \end{itemize}
+\end{itemize}
+
+\subsubsection{Chiến lược thực hiện}
+Sau khi phân tích chi tiết mục tiêu và yêu cầu bài toán, nhóm đã đề ra chiến lược như sau:
+\begin{itemize}
+    \item Xây dựng thuật toán nền để tạo mốc so sánh ban đầu.
+    \item Bổ sung các hướng tối ưu hóa nhằm cải thiện điểm thưởng, thời gian chạy và khả năng thích ứng với surge, hotspot.
+    \item Đánh giá thực nghiệm theo cùng bộ tiêu chí để so sánh công bằng giữa các phương pháp.
+\end{itemize}
+
+\subsection{Xử lý surge và hotspot}
+Để giải quyết nút thắt cổ chai tại các khu vực tập trung đông đơn hàng phát sinh (Surge/Hotspot), nhóm đã triển khai một bộ dò tìm trực tuyến tích hợp cơ chế làm mịn theo thời gian (decay-weighted update). Khi phát hiện có hiện tượng Surge, hệ thống sẽ thực hiện phân bổ chủ động các shipper rảnh rỗi (chưa mang hàng trong túi và chưa có mục tiêu di chuyển) đến các tâm Hotspot dự báo. Để tránh tình trạng shipper tụ tập quá đông tại cùng một Hotspot, thuật toán Hungarian (Linear Sum Assignment) được áp dụng để phân phối đều shipper dựa trên khoảng cách di chuyển thực tế.
+
+\subsection{Giới hạn môi trường}
+
+\subsection{Tiểu kết}
+
+% ---------------------------------------------
+% GREEDY BFS
+% --------------------------------------------- 
+\section{Thuật toán Greedy BFS}
+\subsection{Giới thiệu thuật toán}
+Trong phiên bản nguyên thủy của thuật toán Greedy BFS, mỗi shipper tại mỗi bước thời gian sẽ liên tục quét qua toàn bộ danh sách đơn hàng chưa nhận trên bản đồ để tìm đơn có vị trí lấy hàng gần nhất bằng thuật toán tìm kiếm theo chiều rộng (BFS). 
+
+Nút thắt cổ chai lớn nhất của phương pháp này là tính toán BFS lặp đi lặp lại rất nhiều lần trên lưới có vật cản kích thước lớn ($N \ge 100$). Việc thực hiện BFS cho từng tác tử trên hàng trăm đơn hàng ở mỗi bước thời gian gây tiêu tốn CPU nghiêm trọng, dẫn đến việc chương trình bị TLE trước khi hoàn thành mô phỏng.
+
+\subsection{Triết lý thuật toán}
+\begin{center}
+    \textbf{"Hành động cục bộ, lợi nhuận trước mắt"}
+\end{center}
+
+Thuật toán này đại diện cho tư duy cận thị (myopic) và ích kỷ. Mỗi shipper chỉ quan tâm đến lợi ích lớn nhất và vị trí gần nhất ngay tại thời điểm hiện tại. Nó không có tầm nhìn tương lai, không có sự phối hợp với đồng đội, chấp nhận rủi ro tắc nghẽn hoặc bỏ lỡ các cơ hội lớn hơn ở xa để đổi lấy sự nhanh chóng và đơn giản trong quyết định tức thời.
+
+\subsection{Cách thức hoạt động}
+Thuật toán hoạt động theo chu kỳ sau tại mỗi bước thời gian $t$:
+\begin{enumerate}
+    \item Nếu shipper đang mang hàng trong túi, thuật toán sẽ kiểm tra và ưu tiên chọn đi giao đơn hàng trong túi có deadline ngặt nghèo nhất mà shipper có khả năng giao đúng hạn.
+    \item Nếu shipper còn chỗ trong túi ($K < K_{max}$ và tải trọng chưa vượt $W_{max}$), thuật toán sẽ quét các đơn hàng trên bản đồ và tính toán điểm số hấp dẫn (pickup score) để quyết định có đi lấy thêm hàng hay không.
+    \item Shipper di chuyển một bước theo hướng đi ngắn nhất được chỉ ra bởi BFS đến mục tiêu đã chọn.
+\end{enumerate}
+
+\subsection{Ý tưởng tối ưu và và đánh giá}
+Nhóm đã đề xuất ba cải tiến quan trọng giúp nâng cao đáng kể điểm số và tốc độ của Greedy BFS:
+
+\subsubsection{Spatio-Temporal Score Pre-filtering}
+Thay vì chạy BFS cho tất cả các đơn hàng chưa nhận trên bản đồ, nhóm thiết kế một bộ lọc sơ bộ sử dụng khoảng cách Manhattan kết hợp với thời hạn đơn hàng và mức độ ưu tiên:
+\begin{equation}
+S = M(s, d) + w_t \max(0, e_t - t) - B_p
+\end{equation}
+Trong đó $w_t = 0.01$, và $B_p$ là điểm thưởng cho đơn khẩn cấp (Hỏa tốc được trừ 15.0, Nhanh trừ 5.0). Hệ thống chỉ chạy BFS thực tế trên lưới vật cản cho tối đa 60 ứng viên có điểm $S$ tốt nhất, giúp giảm hơn 90\% số lần gọi hàm BFS.
+
+\subsubsection{PyTorch Parallel APSP}
+Nhóm xây dựng cấu trúc \texttt{PathFinder} sử dụng thư viện PyTorch để tính toán song song thuật toán All-Pairs Shortest Path (APSP) trên toàn bộ lưới trống ngay từ bước khởi tạo. Toàn bộ khoảng cách và bước đi tiếp theo được lưu dưới dạng ma trận $V \times V$ ($V$ là số ô trống). Khi mô phỏng chạy, shipper chỉ cần tra cứu ma trận này với độ phức tạp $O(1)$ để lấy khoảng cách thực tế và hướng di chuyển tiếp theo.
+
+\subsubsection{Dynamic Parameter Scaling}
+Để thuật toán thích ứng với mọi quy mô bản đồ khác nhau, các tham số \texttt{max\_delivery\_delay} và \texttt{max\_opp\_dist} được tính toán động thông qua phép nội suy tuyến tính dựa trên khoảng cách trung bình thực tế (\texttt{avg\_dist}) của lưới:
+\begin{equation}
+y = f(d_{avg}; x_{pts}, y_{pts})
+\end{equation}
+
+\subsection{Kết quả}
+<---Có dẫn chứng cụ thể bằng bảng / hình ảnh--->
+<---Mỗi hình ảnh / bảng phải có phân tích 1-2 câu--->
+
+\subsection{Đánh giá độ phức tạp}
+<--- Có giải thích tại sao--->
+
+\subsection{Đánh giá thuật toán}
+<---Phân tích mức độ tối ưu: optimal, near-optimal hoặc heuristic, kèm điều kiện đảm bảo nếu có--->
+<---Đánh giá ưu nhược điểm thuật toán --->
+<---Tiểu kết--->
+
+% ---------------------------------------------
+% VRP-ORTOOLS
+% ---------------------------------------------
+\section{Thuật toán VRP-Ortool}
+\subsection{Giới thiệu thuật toán}
+Phương pháp tiếp cận quy hoạch toán học sử dụng bộ giải Google OR-Tools để tối ưu hóa lộ trình toàn cục. Trong phiên bản ban đầu, hệ thống thu thập toàn bộ các đơn hàng chưa hoàn thành tại bước thời gian hiện tại, xây dựng ma trận khoảng cách và đưa vào bộ giải VRP (Vehicle Routing Problem) có ràng buộc tải trọng ($W_{max}$) và số lượng hàng ($K_{max}$) để phân bổ đường đi tối ưu cho toàn bộ shipper.
+
+Nút thắt cổ chai lớn nhất là thời gian chạy của bộ giải OR-Tools tăng nhanh theo số lượng tác tử và đơn hàng. Nếu gọi bộ giải VRP tại mỗi bước thời gian $t$, hệ thống sẽ lập tức bị quá tải thời gian thực thi (TLE) do chi phí thiết lập và giải bài toán tối ưu tổ hợp là rất lớn.
+
+\subsection{Triết lý thuật toán}
+\begin{center}
+    \textbf{"Quy hoạch vĩ mô, tối ưu tổng thể"}
+\end{center}
+
+Đây là tư duy của một nhà quản lý logistics cấp cao (Top-down) . Thuật toán tập trung vào việc phân chia tài nguyên và lập lịch trình tối ưu trên bức tranh toàn cảnh để tối đa hóa hiệu quả kinh tế (phần thưởng ròng) . Nó chấp nhận đơn giản hóa các chi tiết vận hành nhỏ nhặt ở thực địa (như việc các shipper phải lách qua nhau trên lưới tọa độ) để đổi lấy một kế hoạch phân bổ công việc hoàn hảo nhất về mặt toán học.
+
+\subsection{Cách thức hoạt động}
+Thuật toán hoạt động theo cơ chế lập lịch định kỳ:
+\begin{enumerate}
+    \item Tại bước $t$, nếu thỏa mãn điều kiện lập lịch lại (replan), hệ thống sẽ trích xuất danh sách đơn hàng khả thi và vị trí của các shipper để xây dựng mô hình toán học VRP.
+    \item Bộ giải OR-Tools được gọi với hàm mục tiêu tối thiểu hóa quãng đường đi và tối đa hóa điểm thưởng đơn hàng giao đúng hạn.
+    \item Kết quả tối ưu được phân tách thành các hàng đợi hành động (targets queue) gán riêng cho từng shipper. Shipper di chuyển theo lộ trình này cho đến khi có yêu cầu replan tiếp theo.
+\end{enumerate}
+
+\subsection{Ý tưởng tối ưu và và đánh giá}
+<---Mỗi phân tích là 1 subsubsection--->
+<---Nêu rõ kết quả và tại sao hiệu quả / tại sao không hiệu quả--->
+Nhóm đã phát triển ba kỹ thuật tối ưu hóa cốt lõi để đảm bảo VRP-Ortools chạy mượt mà dưới 60 phút:
+
+\subsubsection{Adaptive Replan Cooldown}
+Nhóm áp dụng cơ chế cooldown tối thiểu giữa các lần lập lịch lại:
+\begin{equation}
+c_{min} = \min(5, r_{interval})
+\end{equation}
+Shipper chỉ thực hiện replan khi khoảng cách từ lần replan trước lớn hơn $c_{min}$, hoặc khi xuất hiện đơn hàng mới trùng với thời điểm có shipper rảnh rỗi. Điều này giúp loại bỏ các tính toán trùng lặp dư thừa khi hệ thống không có biến động lớn.
+
+\subsubsection{Linear Assignment for Hotspot Repositioning}
+Với các shipper ở trạng thái rảnh rỗi, thay vì để họ đứng yên một chỗ, hệ thống sẽ tự động gán shipper đến các tâm Hotspot dự báo bằng cách giải bài toán phân công Hungarian (Linear Sum Assignment) dựa trên khoảng cách. Việc này giúp shipper chủ động đón đầu các đơn hàng Surge sẽ xuất hiện trong tương lai.
+
+\subsection{Kết quả}
+<---Có dẫn chứng cụ thể bằng bảng / hình ảnh--->
+<---Mỗi hình ảnh / bảng phải có phân tích 1-2 câu--->
+
+\subsection{Đánh giá độ phức tạp}
+<--- Có giải thích tại sao--->
+
+\subsection{Đánh giá thuật toán}
+<---Phân tích mức độ tối ưu: optimal, near-optimal hoặc heuristic, kèm điều kiện đảm bảo nếu có--->
+<---Đánh giá ưu nhược điểm thuật toán --->
+<---Tiểu kết--->
+
+% ---------------------------------------------
+% ACO
+% ---------------------------------------------
+\section{Thuật toán ACO}
+\subsection{Giới thiệu thuật toán}
+<---Giới thiệu thuật toán nguyên thủy / thuật toán cũ--->
+<---Chỉ ra các nút thắt cổ chai--->
+
+\subsection{Triết lý thuật toán}
+
+\subsection{Cách thức hoạt động}
+
+\subsection{Ý tưởng tối ưu và và đánh giá}
+<---Mỗi phân tích là 1 subsubsection--->
+<---Nêu rõ kết quả và tại sao hiệu quả / tại sao không hiệu quả--->
+
+\subsection{Kết quả}
+<---Có dẫn chứng cụ thể bằng bảng / hình ảnh--->
+<---Mỗi hình ảnh / bảng phải có phân tích 1-2 câu--->
+
+\subsection{Đánh giá độ phức tạp}
+<--- Có giải thích tại sao--->
+
+\subsection{Đánh giá thuật toán}
+<---Phân tích mức độ tối ưu: optimal, near-optimal hoặc heuristic, kèm điều kiện đảm bảo nếu có--->
+<---Đánh giá ưu nhược điểm thuật toán --->
+<---Tiểu kết--->
+
+% ---------------------------------------------
+% MAPD-CBS
+% ---------------------------------------------
+\section{Thuật toán MAPD-CBS}
+\subsection{Giới thiệu thuật toán}
+<---Giới thiệu thuật toán nguyên thủy / thuật toán cũ--->
+<---Chỉ ra các nút thắt cổ chai--->
+
+\subsection{Triết lý thuật toán}
+
+\subsection{Cách thức hoạt động}
+
+\subsection{Ý tưởng tối ưu và và đánh giá}
+<---Mỗi phân tích là 1 subsubsection--->
+<---Nêu rõ kết quả và tại sao hiệu quả / tại sao không hiệu quả--->
+
+\subsection{Kết quả}
+<---Có dẫn chứng cụ thể bằng bảng / hình ảnh--->
+<---Mỗi hình ảnh / bảng phải có phân tích 1-2 câu--->
+
+\subsection{Đánh giá độ phức tạp}
+<--- Có giải thích tại sao--->
+
+\subsection{Đánh giá thuật toán}
+<---Phân tích mức độ tối ưu: optimal, near-optimal hoặc heuristic, kèm điều kiện đảm bảo nếu có--->
+<---Đánh giá ưu nhược điểm thuật toán --->
+<---Tiểu kết--->
+
+% ---------------------------------------------
+% TỔNG HỢP
+% ---------------------------------------------
+\section{So sánh tổng hợp và Đánh giá}
+\subsection{So sánh về kết quả}
+
+\subsection{Đánh giá mức độ hiệu quả}
+
+\subsection{Đánh đổi giữa các phương pháp}
+
+% ---------------------------------------------
+% KẾT LUẬN
+% ---------------------------------------------
+\section{Kết luận}
+
+
+% ---------------------------------------------
+% ĐÓNG GÓP
+% ---------------------------------------------
+\section{Đóng góp}
+\begin{itemize}
+    \item \textbf{Nguyễn Hải Nam:} 
+    \item \textbf{Nguyễn Việt Thắng:} 
+    \item \textbf{Võ Minh Dũng:} 
+\end{itemize}
+
+% ---------------------------------------------
+% TÀI LIỆU THAM KHẢO
+% ---------------------------------------------
+\begin{thebibliography}{00}
+\bibitem{b1} G. Eason, B. Noble, and I. N. Sneddon, ``On certain integrals of Lipschitz-Hankel type involving products of Bessel functions,'' Phil. Trans. Roy. Soc. London, vol. A247, pp. 529--551, April 1955.
+\end{thebibliography}
+
+\end{document}
